@@ -264,6 +264,7 @@ app.post('/api/garcom', async (req, res) => {
     }
 });
 
+
 // ==========================================
 // ROTAS DO MÓDULO DE CAIXA
 // ==========================================
@@ -323,7 +324,7 @@ app.get('/api/caixa/resumo', verifyAdminToken, async (req, res) => {
         const caixa = caixaAberto.rows[0];
 
         // LÓGICA ATUALIZADA: Agora busca na nova tabela 'comanda_pagamentos' 
-        // para obter o valor somado de forma exata e parcial
+        // para obter o valor somado de forma exata e dividida
         const vendas = await pool.query(
             "SELECT forma_pagamento, SUM(valor) as total FROM comanda_pagamentos WHERE caixa_id = $1 GROUP BY forma_pagamento",
             [caixa.id]
@@ -339,6 +340,7 @@ app.get('/api/caixa/resumo', verifyAdminToken, async (req, res) => {
         res.status(500).json({ error: 'Erro ao obter resumo do caixa.' });
     }
 });
+
 
 // ==========================================
 // ROTAS ADMINISTRATIVAS
@@ -369,10 +371,14 @@ app.get('/api/mesas', verifyAdminToken, async (req, res) => {
     }
 });
 
+
+// ==========================================
 // LÓGICA DE CHECKOUT ATUALIZADA - GESTÃO DE PAGAMENTOS MÚLTIPLOS E PARCIAIS
+// ==========================================
 app.post('/api/checkout', verifyAdminToken, async (req, res) => {
     let { comanda_id, mesa_id, pagamentos, subtotal, taxa, desconto, final } = req.body;
     let client;
+    
     try {
         client = await pool.connect();
         await client.query('BEGIN');
@@ -404,7 +410,7 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
                 [formaPagamentoPrincipal, comSubtotal, taxa || 0, desconto || 0, comFinal, caixaId, comandaTargetId]
             );
 
-            // REGISTAR OS PAGAMENTOS DETALHADOS NO CAIXA
+            // REGISTAR OS PAGAMENTOS DETALHADOS NO CAIXA DAQUELA PESSOA/PESSOAS
             if (pagamentos && pagamentos.length > 0) {
                 for (const p of pagamentos) {
                     await client.query(
@@ -413,7 +419,7 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
                     );
                 }
             } else {
-                // Fallback de segurança se falhar o envio do array
+                // Fallback de segurança se falhar o envio do array a partir do front-end
                 await client.query(
                     `INSERT INTO comanda_pagamentos (comanda_id, caixa_id, forma_pagamento, valor) VALUES ($1, $2, $3, $4)`,
                     [comandaTargetId, caixaId, formaPagamentoPrincipal, comFinal]
@@ -421,11 +427,14 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
             }
         }
 
-        if (mesa_id) await client.query('UPDATE mesas SET status = $1, chamando_garcom = FALSE, token_sessao = NULL WHERE id = $2', ['livre', mesa_id]);
+        if (mesa_id) {
+            await client.query('UPDATE mesas SET status = $1, chamando_garcom = FALSE, token_sessao = NULL WHERE id = $2', ['livre', mesa_id]);
+        }
         
         await client.query('COMMIT');
         atualizarPainel();
         res.json({ success: true });
+        
     } catch (error) {
         if (client) await client.query('ROLLBACK');
         console.error('Erro no checkout:', error);
@@ -438,6 +447,7 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
 app.post('/api/admin/mesa/cancelar', verifyAdminToken, async (req, res) => {
     let { mesa_id, comanda_id } = req.body;
     let client;
+    
     try {
         client = await pool.connect();
         await client.query('BEGIN');
@@ -448,15 +458,19 @@ app.post('/api/admin/mesa/cancelar', verifyAdminToken, async (req, res) => {
         }
 
         if (comanda_id) {
-            await client.query('DELETE FROM comanda_pagamentos WHERE comanda_id = $1', [comanda_id]); // Segurança
+            await client.query('DELETE FROM comanda_pagamentos WHERE comanda_id = $1', [comanda_id]); // Segurança de limpeza
             await client.query('DELETE FROM comanda_itens WHERE comanda_id = $1', [comanda_id]);
             await client.query('DELETE FROM comandas WHERE id = $1', [comanda_id]);
         }
-        if (mesa_id) await client.query('UPDATE mesas SET status = $1, chamando_garcom = FALSE, token_sessao = NULL WHERE id = $2', ['livre', mesa_id]);
+        
+        if (mesa_id) {
+            await client.query('UPDATE mesas SET status = $1, chamando_garcom = FALSE, token_sessao = NULL WHERE id = $2', ['livre', mesa_id]);
+        }
 
         await client.query('COMMIT');
         atualizarPainel();
         res.json({ success: true, message: 'Mesa cancelada.' });
+        
     } catch (error) {
         if (client) await client.query('ROLLBACK');
         res.status(500).json({ error: 'Erro ao cancelar' });
@@ -468,6 +482,7 @@ app.post('/api/admin/mesa/cancelar', verifyAdminToken, async (req, res) => {
 app.post('/api/admin/mesa/adicionar-itens', verifyAdminToken, async (req, res) => {
     let { mesa_id, cart } = req.body;
     let client;
+    
     try {
         client = await pool.connect();
         await client.query('BEGIN');
@@ -492,6 +507,7 @@ app.post('/api/admin/mesa/adicionar-itens', verifyAdminToken, async (req, res) =
         await client.query('COMMIT');
         atualizarPainel();
         res.json({ success: true });
+        
     } catch (error) {
         if (client) await client.query('ROLLBACK');
         res.status(500).json({ error: 'Erro ao adicionar' });
@@ -518,9 +534,11 @@ app.get('/api/historico', verifyAdminToken, async (req, res) => {
                    COALESCE((SELECT json_agg(json_build_object('nome_item', ci.nome_item, 'quantidade', ci.quantidade, 'preco_unitario', ci.preco_unitario, 'observacoes', ci.observacoes)) FROM comanda_itens ci WHERE ci.comanda_id = c.id), '[]'::json) as items
             FROM comandas c LEFT JOIN mesas m ON c.mesa_id = m.id WHERE (LOWER(c.status) = 'fechada' OR c.data_fechamento IS NOT NULL)
         `;
+        
         if (filtro === 'dia') query += ` AND c.data_fechamento >= NOW() - INTERVAL '1 day'`;
         else if (filtro === 'semana') query += ` AND c.data_fechamento >= NOW() - INTERVAL '7 days'`;
         else if (filtro === 'mes') query += ` AND c.data_fechamento >= NOW() - INTERVAL '30 days'`;
+        
         query += ` ORDER BY c.data_fechamento DESC LIMIT 150`;
 
         const result = await pool.query(query);
@@ -530,27 +548,59 @@ app.get('/api/historico', verifyAdminToken, async (req, res) => {
     }
 });
 
+
+// ==========================================
+// ESTATÍSTICAS COM CÁLCULO DE MÉDIAS REAIS
+// ==========================================
 app.get('/api/estatisticas', verifyAdminToken, async (req, res) => {
     try {
+        // Faturamento Bruto Acumulado (Hoje, 7 dias, 30 dias)
         const fatDia = pool.query(`SELECT SUM(valor_total_final) as total FROM comandas WHERE (LOWER(status) = 'fechada' OR data_fechamento IS NOT NULL) AND data_fechamento >= NOW() - INTERVAL '1 day'`);
         const fatSemana = pool.query(`SELECT SUM(valor_total_final) as total FROM comandas WHERE (LOWER(status) = 'fechada' OR data_fechamento IS NOT NULL) AND data_fechamento >= NOW() - INTERVAL '7 days'`);
         const fatMes = pool.query(`SELECT SUM(valor_total_final) as total FROM comandas WHERE (LOWER(status) = 'fechada' OR data_fechamento IS NOT NULL) AND data_fechamento >= NOW() - INTERVAL '30 days'`);
-        const itensVendidos = pool.query(`SELECT ci.nome_item, SUM(ci.quantidade) as total_qtd FROM comanda_itens ci JOIN comandas c ON ci.comanda_id = c.id WHERE (LOWER(c.status) = 'fechada' OR c.data_fechamento IS NOT NULL) GROUP BY ci.nome_item ORDER BY total_qtd DESC`);
-        const horaPico = pool.query(`SELECT EXTRACT(HOUR FROM data_abertura) as hora, COUNT(*) as qtd FROM comandas WHERE (LOWER(status) = 'fechada' OR data_fechamento IS NOT NULL) AND data_abertura IS NOT NULL GROUP BY hora ORDER BY qtd DESC LIMIT 1`);
-        const diaPico = pool.query(`SELECT TO_CHAR(data_abertura, 'Day') as dia, COUNT(*) as qtd FROM comandas WHERE (LOWER(status) = 'fechada' OR data_fechamento IS NOT NULL) AND data_abertura IS NOT NULL GROUP BY dia ORDER BY qtd DESC LIMIT 1`);
+        
+        // NOVO: Cálculo de Médias Históricas Reais (Baseado nos dias/semanas de funcionamento)
+        const mediasQry = pool.query(`
+            SELECT 
+                COALESCE(SUM(valor_total_final) / NULLIF(COUNT(DISTINCT DATE_TRUNC('day', data_fechamento)), 0), 0) as media_dia,
+                COALESCE(SUM(valor_total_final) / NULLIF(COUNT(DISTINCT DATE_TRUNC('week', data_fechamento)), 0), 0) as media_semana,
+                COALESCE(SUM(valor_total_final) / NULLIF(COUNT(DISTINCT DATE_TRUNC('month', data_fechamento)), 0), 0) as media_mes
+            FROM comandas 
+            WHERE (LOWER(status) = 'fechada' OR data_fechamento IS NOT NULL)
+        `);
 
-        const [rFatDia, rFatSemana, rFatMes, rItens, rHora, rDia] = await Promise.all([fatDia, fatSemana, fatMes, itensVendidos, horaPico, diaPico]);
+        // Itens mais vendidos
+        const itensVendidos = pool.query(`
+            SELECT ci.nome_item, SUM(ci.quantidade) as total_qtd 
+            FROM comanda_itens ci 
+            JOIN comandas c ON ci.comanda_id = c.id 
+            WHERE (LOWER(c.status) = 'fechada' OR c.data_fechamento IS NOT NULL) 
+            GROUP BY ci.nome_item 
+            ORDER BY total_qtd DESC
+        `);
+
+        const [rFatDia, rFatSemana, rFatMes, rMedias, rItens] = await Promise.all([fatDia, fatSemana, fatMes, mediasQry, itensVendidos]);
 
         res.json({
-            faturamento: { dia: rFatDia.rows[0]?.total || 0, semana: rFatSemana.rows[0]?.total || 0, mes: rFatMes.rows[0]?.total || 0 },
-            itens: rItens.rows || [],
-            horaPico: rHora.rows.length > 0 ? `${Math.floor(rHora.rows[0].hora)}:00` : 'N/A',
-            diaPico: rDia.rows.length > 0 ? rDia.rows[0].dia.trim() : 'N/A'
+            faturamento: { 
+                dia: rFatDia.rows[0]?.total || 0, 
+                semana: rFatSemana.rows[0]?.total || 0, 
+                mes: rFatMes.rows[0]?.total || 0 
+            },
+            medias: {
+                dia: rMedias.rows[0]?.media_dia || 0,
+                semana: rMedias.rows[0]?.media_semana || 0,
+                mes: rMedias.rows[0]?.media_mes || 0
+            },
+            itens: rItens.rows || []
         });
+        
     } catch (error) {
+        console.error("Erro nas estatísticas:", error);
         res.status(500).json({ error: 'Erro nas estatísticas' });
     }
 });
+
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
