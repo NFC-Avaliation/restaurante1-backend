@@ -11,13 +11,12 @@ const app = express();
 const server = http.createServer(app);
 
 app.set('trust proxy', 1);
+
 // ==========================================
 // 1. TRAVA DE SEGURANÇA: CORS RESTRITO
 // ==========================================
-// URL principal do Front-end (usada para os redirecionamentos de QR Code/NFC)
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://nfc-avaliation.github.io';
 
-// Lista branca (Whitelist) de domínios permitidos a aceder à sua API
 const allowedOrigins = [
     'http://localhost:3000',
     'http://127.0.0.1:5500',
@@ -27,14 +26,13 @@ const allowedOrigins = [
 
 const corsOptions = {
     origin: function (origin, callback) {
-        // Se a origem estiver na lista ou não houver origem (ex: Postman/Navegador direto), permite.
         if (!origin || allowedOrigins.includes(origin)) {
             callback(null, true);
         } else {
             callback(new Error('Acesso bloqueado pelo CORS'));
         }
     },
-    credentials: true // Permite o envio de cabeçalhos de autorização
+    credentials: true
 };
 
 app.use(cors(corsOptions));
@@ -43,16 +41,15 @@ app.use(express.json());
 // ==========================================
 // 2. TRAVA DE SEGURANÇA: RATE LIMITING (Anti-DDoS)
 // ==========================================
-// Limita cada IP a 100 requisições por minuto. Impede que robôs derrubem a API.
 const apiLimiter = rateLimit({
     windowMs: 1 * 60 * 1000, // 1 minuto
     max: 100,
     message: { error: 'Muitas requisições originadas deste IP. Aguarde um minuto.' },
-    validate: { trustProxy: false } // Impede bloqueios errados do proxy no Render
+    validate: { trustProxy: false }
 });
 app.use('/api/', apiLimiter);
 
-// Configuração do Socket.io com CORS explícito e protegido
+// Configuração do Socket.io
 const io = new Server(server, {
     cors: {
         origin: allowedOrigins,
@@ -61,7 +58,7 @@ const io = new Server(server, {
     }
 });
 
-// Configurações do Sistema de Banco de Dados
+// Configurações do Banco de Dados
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL || 'postgresql://postgres:JTSZTBKgDTGCZ5LF@db.jfyjrtllkqmvixosrtof.supabase.co:5432/postgres',
     ssl: { rejectUnauthorized: false },
@@ -73,24 +70,47 @@ pool.on('error', (err) => {
     console.error('Erro inesperado no banco de dados:', err);
 });
 
+// ==========================================
+// INICIALIZAÇÃO DA BASE DE DADOS (AUTO-MIGRATION)
+// ==========================================
+// Esta função cria a tabela de múltiplos pagamentos automaticamente caso não exista!
+async function initDB() {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS comanda_pagamentos (
+                id SERIAL PRIMARY KEY,
+                comanda_id INT,
+                caixa_id INT,
+                forma_pagamento VARCHAR(50),
+                valor DECIMAL(10,2),
+                data_pagamento TIMESTAMP DEFAULT NOW()
+            );
+        `);
+        console.log("✅ Tabela 'comanda_pagamentos' verificada/criada com sucesso!");
+    } catch (err) {
+        console.error("❌ Erro ao criar tabela de pagamentos múltiplos:", err);
+    }
+}
+initDB();
+
 // Credenciais de Admin Seguras
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
 const JWT_SECRET = process.env.JWT_SECRET || 'chave_super_secreta_restaurante_2026';
 
 // ==========================================
-// 3. TRAVA DE SEGURANÇA: MIDDLEWARE DE AUTENTICAÇÃO (JWT)
+// 3. TRAVA DE SEGURANÇA: MIDDLEWARE JWT
 // ==========================================
 function verifyAdminToken(req, res, next) {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1]; // Formato: "Bearer TOKEN_AQUI"
+    const token = authHeader && authHeader.split(' ')[1];
 
     if (!token) return res.status(401).json({ error: 'Acesso negado. Token ausente.' });
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
         if (err) return res.status(403).json({ error: 'Token inválido ou expirado. Faça login novamente.' });
         req.user = user;
-        next(); // Token válido, pode prosseguir para a rota
+        next();
     });
 }
 
@@ -104,12 +124,11 @@ function atualizarPainel() {
 }
 
 // ==========================================
-// ROTA DE LOGIN DO PAINEL (Gera o JWT)
+// ROTA DE LOGIN DO PAINEL
 // ==========================================
 app.post('/api/admin/login', (req, res) => {
     const { user, pass } = req.body;
     if (user === ADMIN_USER && pass === ADMIN_PASS) {
-        // Gera um token válido por 12 horas
         const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '12h' });
         return res.json({ success: true, token });
     }
@@ -117,9 +136,8 @@ app.post('/api/admin/login', (req, res) => {
 });
 
 // ==========================================
-// ROTAS PÚBLICAS (CLIENTES NA MESA) - Não precisam de JWT, usam a Sessão NFC
+// ROTAS PÚBLICAS (CLIENTES NA MESA)
 // ==========================================
-
 app.get('/api/mesa/acessar', async (req, res) => {
     const { mesa } = req.query;
     if (!mesa) return res.status(400).send('Número da mesa não especificado.');
@@ -247,10 +265,9 @@ app.post('/api/garcom', async (req, res) => {
 });
 
 // ==========================================
-// ROTAS DO MÓDULO DE CAIXA (NOVAS)
+// ROTAS DO MÓDULO DE CAIXA
 // ==========================================
 
-// 1. Verifica se há um caixa aberto e retorna os detalhes
 app.get('/api/caixa/status', verifyAdminToken, async (req, res) => {
     try {
         const result = await pool.query("SELECT * FROM caixas WHERE status = 'aberto' ORDER BY id DESC LIMIT 1");
@@ -265,7 +282,6 @@ app.get('/api/caixa/status', verifyAdminToken, async (req, res) => {
     }
 });
 
-// 2. Abre um novo turno/caixa
 app.post('/api/caixa/abrir', verifyAdminToken, async (req, res) => {
     const { saldo_inicial } = req.body;
     try {
@@ -284,7 +300,6 @@ app.post('/api/caixa/abrir', verifyAdminToken, async (req, res) => {
     }
 });
 
-// 3. Fecha o turno atual
 app.post('/api/caixa/fechar', verifyAdminToken, async (req, res) => {
     try {
         const result = await pool.query(
@@ -300,7 +315,6 @@ app.post('/api/caixa/fechar', verifyAdminToken, async (req, res) => {
     }
 });
 
-// 4. Retorna o total de pagamentos (Dinheiro, PIX, Cartão) para o caixa atual
 app.get('/api/caixa/resumo', verifyAdminToken, async (req, res) => {
     try {
         const caixaAberto = await pool.query("SELECT * FROM caixas WHERE status = 'aberto' ORDER BY id DESC LIMIT 1");
@@ -308,9 +322,10 @@ app.get('/api/caixa/resumo', verifyAdminToken, async (req, res) => {
 
         const caixa = caixaAberto.rows[0];
 
-        // Soma todas as vendas finalizadas que estão associadas a este caixa, agrupadas pelo método de pagamento
+        // LÓGICA ATUALIZADA: Agora busca na nova tabela 'comanda_pagamentos' 
+        // para obter o valor somado de forma exata e parcial
         const vendas = await pool.query(
-            "SELECT forma_pagamento, SUM(valor_total_final) as total FROM comandas WHERE caixa_id = $1 GROUP BY forma_pagamento",
+            "SELECT forma_pagamento, SUM(valor) as total FROM comanda_pagamentos WHERE caixa_id = $1 GROUP BY forma_pagamento",
             [caixa.id]
         );
 
@@ -326,7 +341,7 @@ app.get('/api/caixa/resumo', verifyAdminToken, async (req, res) => {
 });
 
 // ==========================================
-// ROTAS ADMINISTRATIVAS - BLINDADAS COM `verifyAdminToken`
+// ROTAS ADMINISTRATIVAS
 // ==========================================
 
 app.post('/api/garcom/atender', verifyAdminToken, async (req, res) => {
@@ -354,9 +369,9 @@ app.get('/api/mesas', verifyAdminToken, async (req, res) => {
     }
 });
 
-// ROTA ATUALIZADA: Agora o checkout encontra o caixa aberto e carimba o seu ID na comanda!
+// LÓGICA DE CHECKOUT ATUALIZADA - GESTÃO DE PAGAMENTOS MÚLTIPLOS E PARCIAIS
 app.post('/api/checkout', verifyAdminToken, async (req, res) => {
-    let { comanda_id, mesa_id, forma_pagamento, subtotal, taxa, desconto, final } = req.body;
+    let { comanda_id, mesa_id, pagamentos, subtotal, taxa, desconto, final } = req.body;
     let client;
     try {
         client = await pool.connect();
@@ -380,11 +395,30 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
             let comSubtotal = itensSum.rows[0]?.soma || subtotal || 0;
             let comFinal = comSubtotal - (desconto || 0) + (taxa || 0);
 
+            // A forma_pagamento principal na comanda passa a ser a primeira (se for só uma) ou 'MULTIPLOS'
+            let formaPagamentoPrincipal = req.body.forma_pagamento || 'MULTIPLOS';
+
             // ATUALIZA A COMANDA COM O ID DO CAIXA
             await client.query(
                 `UPDATE comandas SET status = 'fechada', data_fechamento = NOW(), forma_pagamento = $1, subtotal = $2, taxa_servico = $3, desconto = $4, valor_total_final = $5, caixa_id = $6 WHERE id = $7`,
-                [forma_pagamento || 'CARTAO', comSubtotal, taxa || 0, desconto || 0, comFinal, caixaId, comandaTargetId]
+                [formaPagamentoPrincipal, comSubtotal, taxa || 0, desconto || 0, comFinal, caixaId, comandaTargetId]
             );
+
+            // REGISTAR OS PAGAMENTOS DETALHADOS NO CAIXA
+            if (pagamentos && pagamentos.length > 0) {
+                for (const p of pagamentos) {
+                    await client.query(
+                        `INSERT INTO comanda_pagamentos (comanda_id, caixa_id, forma_pagamento, valor) VALUES ($1, $2, $3, $4)`,
+                        [comandaTargetId, caixaId, p.metodo, p.valor]
+                    );
+                }
+            } else {
+                // Fallback de segurança se falhar o envio do array
+                await client.query(
+                    `INSERT INTO comanda_pagamentos (comanda_id, caixa_id, forma_pagamento, valor) VALUES ($1, $2, $3, $4)`,
+                    [comandaTargetId, caixaId, formaPagamentoPrincipal, comFinal]
+                );
+            }
         }
 
         if (mesa_id) await client.query('UPDATE mesas SET status = $1, chamando_garcom = FALSE, token_sessao = NULL WHERE id = $2', ['livre', mesa_id]);
@@ -414,6 +448,7 @@ app.post('/api/admin/mesa/cancelar', verifyAdminToken, async (req, res) => {
         }
 
         if (comanda_id) {
+            await client.query('DELETE FROM comanda_pagamentos WHERE comanda_id = $1', [comanda_id]); // Segurança
             await client.query('DELETE FROM comanda_itens WHERE comanda_id = $1', [comanda_id]);
             await client.query('DELETE FROM comandas WHERE id = $1', [comanda_id]);
         }
