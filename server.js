@@ -605,4 +605,21 @@ app.get('/api/estatisticas', verifyAdminToken, async (req, res) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Servidor rodando protegido na porta ${PORT}`);
+})
+    // Exemplo de rota no seu backend Node.js
+app.post('/api/delivery/novo', async (req, res) => {
+    try {
+        const { cliente, itens, valor_total, origem } = req.body;
+
+        // 1. Gravar o pedido na base de dados (tabela de delivery / comanda digital)
+        // Exemplo: const novoPedido = await db.query(...)
+
+        // 2. Avisar o painel do gerente em TEMPO REAL usando Socket.io
+        // io.emit('atualizacao_dados'); // Faz o painel do caixa atualizar as colunas na hora!
+
+        res.status(200).json({ sucesso: true, mensagem: "Pedido de delivery recebido com sucesso!" });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ erro: "Erro ao processar pedido de delivery" });
+    }
 });
