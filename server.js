@@ -139,7 +139,6 @@ app.get('/api/mesa/acessar', async (req, res) => {
             await client.query('UPDATE mesas SET token_sessao = $1 WHERE id = $2', [token, mesaObj.id]);
         }
 
-        // Usa a variável FRONTEND_URL definida no topo
         res.redirect(`${FRONTEND_URL}/index.html?mesa=${mesa}&token=${token}`);
     } catch (error) {
         res.status(500).send('Erro interno ao acessar a mesa.');
@@ -198,7 +197,6 @@ app.post('/api/pedidos', async (req, res) => {
             comanda_id = comandaRes.rows[0].id;
         }
 
-        // SOLUÇÃO APLICADA: Inserção do ID do Prato (item_id_cache) no banco de dados com fallback de segurança
         for (const item of cart) {
             await client.query(
                 `INSERT INTO comanda_itens (comanda_id, item_id_cache, nome_item, quantidade, preco_unitario, observacoes) VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -216,7 +214,7 @@ app.post('/api/pedidos', async (req, res) => {
         if (error.message === 'MESA_NOT_FOUND') return res.status(404).json({ error: 'Mesa não encontrada' });
         if (error.message === 'INVALID_SESSION') return res.status(403).json({ error: 'Sessão inválida' });
         
-        console.error('ERRO FATAL NO PEDIDO:', error); // Mantido para diagnóstico fácil
+        console.error('ERRO FATAL NO PEDIDO:', error);
         res.status(500).json({ error: 'Erro ao processar pedido' });
     } finally {
         if (client) client.release();
@@ -249,6 +247,85 @@ app.post('/api/garcom', async (req, res) => {
 });
 
 // ==========================================
+// ROTAS DO MÓDULO DE CAIXA (NOVAS)
+// ==========================================
+
+// 1. Verifica se há um caixa aberto e retorna os detalhes
+app.get('/api/caixa/status', verifyAdminToken, async (req, res) => {
+    try {
+        const result = await pool.query("SELECT * FROM caixas WHERE status = 'aberto' ORDER BY id DESC LIMIT 1");
+        if (result.rows.length > 0) {
+            res.json({ aberto: true, caixa: result.rows[0] });
+        } else {
+            res.json({ aberto: false });
+        }
+    } catch (error) {
+        console.error('Erro ao verificar caixa:', error);
+        res.status(500).json({ error: 'Erro ao verificar status do caixa.' });
+    }
+});
+
+// 2. Abre um novo turno/caixa
+app.post('/api/caixa/abrir', verifyAdminToken, async (req, res) => {
+    const { saldo_inicial } = req.body;
+    try {
+        const check = await pool.query("SELECT id FROM caixas WHERE status = 'aberto'");
+        if (check.rows.length > 0) {
+            return res.status(400).json({ error: 'Já existe um caixa aberto.' });
+        }
+        const result = await pool.query(
+            "INSERT INTO caixas (status, saldo_inicial, data_abertura) VALUES ('aberto', $1, NOW()) RETURNING *",
+            [saldo_inicial || 0]
+        );
+        res.json({ success: true, caixa: result.rows[0] });
+    } catch (error) {
+        console.error('Erro ao abrir caixa:', error);
+        res.status(500).json({ error: 'Erro ao abrir caixa.' });
+    }
+});
+
+// 3. Fecha o turno atual
+app.post('/api/caixa/fechar', verifyAdminToken, async (req, res) => {
+    try {
+        const result = await pool.query(
+            "UPDATE caixas SET status = 'fechado', data_fechamento = NOW() WHERE status = 'aberto' RETURNING *"
+        );
+        if (result.rowCount === 0) {
+            return res.status(400).json({ error: 'Nenhum caixa aberto encontrado.' });
+        }
+        res.json({ success: true, caixa: result.rows[0] });
+    } catch (error) {
+        console.error('Erro ao fechar caixa:', error);
+        res.status(500).json({ error: 'Erro ao fechar caixa.' });
+    }
+});
+
+// 4. Retorna o total de pagamentos (Dinheiro, PIX, Cartão) para o caixa atual
+app.get('/api/caixa/resumo', verifyAdminToken, async (req, res) => {
+    try {
+        const caixaAberto = await pool.query("SELECT * FROM caixas WHERE status = 'aberto' ORDER BY id DESC LIMIT 1");
+        if (caixaAberto.rows.length === 0) return res.json({ aberto: false });
+
+        const caixa = caixaAberto.rows[0];
+
+        // Soma todas as vendas finalizadas que estão associadas a este caixa, agrupadas pelo método de pagamento
+        const vendas = await pool.query(
+            "SELECT forma_pagamento, SUM(valor_total_final) as total FROM comandas WHERE caixa_id = $1 GROUP BY forma_pagamento",
+            [caixa.id]
+        );
+
+        res.json({
+            aberto: true,
+            caixa: caixa,
+            vendas: vendas.rows
+        });
+    } catch (error) {
+        console.error('Erro no resumo do caixa:', error);
+        res.status(500).json({ error: 'Erro ao obter resumo do caixa.' });
+    }
+});
+
+// ==========================================
 // ROTAS ADMINISTRATIVAS - BLINDADAS COM `verifyAdminToken`
 // ==========================================
 
@@ -277,6 +354,7 @@ app.get('/api/mesas', verifyAdminToken, async (req, res) => {
     }
 });
 
+// ROTA ATUALIZADA: Agora o checkout encontra o caixa aberto e carimba o seu ID na comanda!
 app.post('/api/checkout', verifyAdminToken, async (req, res) => {
     let { comanda_id, mesa_id, forma_pagamento, subtotal, taxa, desconto, final } = req.body;
     let client;
@@ -291,12 +369,22 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
         }
 
         if (comandaTargetId) {
+            // PROCURA QUAL O CAIXA ABERTO AGORA
+            let caixaId = null;
+            const caixaAberto = await client.query("SELECT id FROM caixas WHERE status = 'aberto' ORDER BY id DESC LIMIT 1");
+            if (caixaAberto.rows.length > 0) {
+                caixaId = caixaAberto.rows[0].id;
+            }
+
             const itensSum = await client.query('SELECT SUM(quantidade * preco_unitario) as soma FROM comanda_itens WHERE comanda_id = $1', [comandaTargetId]);
             let comSubtotal = itensSum.rows[0]?.soma || subtotal || 0;
             let comFinal = comSubtotal - (desconto || 0) + (taxa || 0);
 
-            await client.query(`UPDATE comandas SET status = 'fechada', data_fechamento = NOW(), forma_pagamento = $1, subtotal = $2, taxa_servico = $3, desconto = $4, valor_total_final = $5 WHERE id = $6`,
-                [forma_pagamento || 'CARTAO', comSubtotal, taxa || 0, desconto || 0, comFinal, comandaTargetId]);
+            // ATUALIZA A COMANDA COM O ID DO CAIXA
+            await client.query(
+                `UPDATE comandas SET status = 'fechada', data_fechamento = NOW(), forma_pagamento = $1, subtotal = $2, taxa_servico = $3, desconto = $4, valor_total_final = $5, caixa_id = $6 WHERE id = $7`,
+                [forma_pagamento || 'CARTAO', comSubtotal, taxa || 0, desconto || 0, comFinal, caixaId, comandaTargetId]
+            );
         }
 
         if (mesa_id) await client.query('UPDATE mesas SET status = $1, chamando_garcom = FALSE, token_sessao = NULL WHERE id = $2', ['livre', mesa_id]);
@@ -306,6 +394,7 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
         res.json({ success: true });
     } catch (error) {
         if (client) await client.query('ROLLBACK');
+        console.error('Erro no checkout:', error);
         res.status(500).json({ error: 'Erro ao fechar comanda' });
     } finally {
         if (client) client.release();
@@ -360,7 +449,6 @@ app.post('/api/admin/mesa/adicionar-itens', verifyAdminToken, async (req, res) =
             comanda_id = comandaRes.rows[0].id;
         }
 
-        // SOLUÇÃO APLICADA AQUI TAMBÉM: Inserção do ID do Prato pelo Painel Admin
         for (const item of cart) {
             await client.query(`INSERT INTO comanda_itens (comanda_id, item_id_cache, nome_item, quantidade, preco_unitario, observacoes) VALUES ($1, $2, $3, $4, $5, $6)`,
                 [comanda_id, item.dishId || 'item', item.name, item.quantity, item.unitPrice, item.notes || '']);
