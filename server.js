@@ -611,15 +611,17 @@ app.post('/api/delivery/novo', async (req, res) => {
     try {
         const { cliente, itens, valor_total, origem } = req.body;
 
-        // 1. Gravar o pedido na base de dados (tabela de delivery / comanda digital)
-        // Exemplo: const novoPedido = await db.query(...)
+        // 1. Insere o pedido na base de dados (tabela de delivery)
+        // Exemplo: const resultado = await db.query('INSERT INTO pedidos_delivery (...) VALUES (...)', [...]);
 
-        // 2. Avisar o painel do gerente em TEMPO REAL usando Socket.io
-        // io.emit('atualizacao_dados'); // Faz o painel do caixa atualizar as colunas na hora!
+        // 2. Avisa o painel do gerente instantaneamente via Socket.io
+        if (global.io) {
+            global.io.emit('atualizacao_delivery'); // Dispara para atualizar a tela do caixa
+        }
 
-        res.status(200).json({ sucesso: true, mensagem: "Pedido de delivery recebido com sucesso!" });
+        res.status(200).json({ sucesso: true, mensagem: "Pedido registado com sucesso!" });
     } catch (error) {
-        console.error(error);
-        res.status(500).json({ erro: "Erro ao processar pedido de delivery" });
+        console.error("Erro ao salvar delivery:", error);
+        res.status(500).json({ erro: "Erro ao salvar pedido" });
     }
 });
