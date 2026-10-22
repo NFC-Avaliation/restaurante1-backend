@@ -40,15 +40,17 @@ app.use(cors(corsOptions));
 app.use(express.json());
 
 // ==========================================
-// RATE LIMITING
+// LIMITE DE REQUISIÇÕES
 // ==========================================
 const apiLimiter = rateLimit({
-    windowMs: 1 * 60 * 1000,
+    windowMs: 60 * 1000,
     max: 100,
     message: {
         error: 'Muitas requisições originadas deste IP. Aguarde um minuto.'
     },
-    validate: { trustProxy: false }
+    validate: {
+        trustProxy: false
+    }
 });
 
 app.use('/api/', apiLimiter);
@@ -71,17 +73,19 @@ const pool = new Pool({
     connectionString:
         process.env.DATABASE_URL ||
         'postgresql://postgres:JTSZTBKgDTGCZ5LF@db.jfyjrtllkqmvixosrtof.supabase.co:5432/postgres',
-    ssl: { rejectUnauthorized: false },
+    ssl: {
+        rejectUnauthorized: false
+    },
     max: 20,
     idleTimeoutMillis: 30000
 });
 
-pool.on('error', (err) => {
+pool.on('error', err => {
     console.error('Erro inesperado no banco de dados:', err);
 });
 
 // ==========================================
-// INICIALIZAÇÃO DA TABELA DE PAGAMENTOS
+// TABELA DE PAGAMENTOS
 // ==========================================
 async function initDB() {
     try {
@@ -97,11 +101,11 @@ async function initDB() {
         `);
 
         console.log(
-            "✅ Tabela 'comanda_pagamentos' verificada/criada com sucesso!"
+            "Tabela 'comanda_pagamentos' verificada/criada com sucesso."
         );
     } catch (err) {
         console.error(
-            '❌ Erro ao criar tabela de pagamentos múltiplos:',
+            'Erro ao criar tabela de pagamentos múltiplos:',
             err
         );
     }
@@ -114,6 +118,7 @@ initDB();
 // ==========================================
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
+
 const JWT_SECRET =
     process.env.JWT_SECRET || 'chave_super_secreta_restaurante_2026';
 
@@ -142,7 +147,10 @@ function verifyAdminToken(req, res, next) {
     });
 }
 
-io.on('connection', (socket) => {
+// ==========================================
+// CONEXÕES EM TEMPO REAL
+// ==========================================
+io.on('connection', socket => {
     console.log(`Cliente conectado: ${socket.id}`);
 
     socket.on('disconnect', () => {
@@ -173,13 +181,13 @@ app.post('/api/admin/login', (req, res) => {
         });
     }
 
-    res.status(401).json({
+    return res.status(401).json({
         error: 'Utilizador ou senha incorretos!'
     });
 });
 
 // ==========================================
-// ACESSO À MESA
+// ACESSAR MESA
 // ==========================================
 app.get('/api/mesa/acessar', async (req, res) => {
     const { mesa } = req.query;
@@ -217,16 +225,20 @@ app.get('/api/mesa/acessar', async (req, res) => {
             token = 'tok_' + crypto.randomBytes(16).toString('hex');
 
             await client.query(
-                'UPDATE mesas SET token_sessao = $1 WHERE id = $2',
+                `
+                    UPDATE mesas
+                    SET token_sessao = $1
+                    WHERE id = $2
+                `,
                 [token, mesaObj.id]
             );
         }
 
-        res.redirect(
+        return res.redirect(
             `${FRONTEND_URL}/index.html?mesa=${mesa}&token=${token}`
         );
     } catch (error) {
-        res.status(500).send(
+        return res.status(500).send(
             'Erro interno ao acessar a mesa.'
         );
     } finally {
@@ -235,7 +247,7 @@ app.get('/api/mesa/acessar', async (req, res) => {
 });
 
 // ==========================================
-// SESSÃO DA MESA
+// INICIAR SESSÃO DA MESA
 // ==========================================
 app.post('/api/mesa/sessao', async (req, res) => {
     const { mesa_numero } = req.body;
@@ -266,17 +278,21 @@ app.post('/api/mesa/sessao', async (req, res) => {
             token = 'tok_' + crypto.randomBytes(16).toString('hex');
 
             await client.query(
-                'UPDATE mesas SET token_sessao = $1 WHERE id = $2',
+                `
+                    UPDATE mesas
+                    SET token_sessao = $1
+                    WHERE id = $2
+                `,
                 [token, mesa.id]
             );
         }
 
-        res.json({
+        return res.json({
             success: true,
             token_sessao: token
         });
     } catch (error) {
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Erro ao iniciar sessão'
         });
     } finally {
@@ -285,7 +301,7 @@ app.post('/api/mesa/sessao', async (req, res) => {
 });
 
 // ==========================================
-// PEDIDOS DAS MESAS
+// RECEBER PEDIDO DA MESA
 // ==========================================
 app.post('/api/pedidos', async (req, res) => {
     const { mesa_numero, cart, token_sessao } = req.body;
@@ -330,7 +346,10 @@ app.post('/api/pedidos', async (req, res) => {
                 SELECT id
                 FROM comandas
                 WHERE mesa_id = $1
-                AND (LOWER(status) = 'aberta' OR status IS NULL)
+                AND (
+                    LOWER(status) = 'aberta'
+                    OR status IS NULL
+                )
             `,
             [mesa.id]
         );
@@ -343,7 +362,11 @@ app.post('/api/pedidos', async (req, res) => {
 
             const novaComanda = await client.query(
                 `
-                    INSERT INTO comandas (codigo, mesa_id, status)
+                    INSERT INTO comandas (
+                        codigo,
+                        mesa_id,
+                        status
+                    )
                     VALUES ($1, $2, $3)
                     RETURNING id
                 `,
@@ -394,7 +417,7 @@ app.post('/api/pedidos', async (req, res) => {
             tipo: 'success'
         });
 
-        res.json({
+        return res.json({
             success: true,
             message: 'Pedido enviado!'
         });
@@ -413,9 +436,9 @@ app.post('/api/pedidos', async (req, res) => {
             });
         }
 
-        console.error('ERRO FATAL NO PEDIDO:', error);
+        console.error('Erro ao processar pedido da mesa:', error);
 
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Erro ao processar pedido'
         });
     } finally {
@@ -442,41 +465,45 @@ app.post('/api/garcom', async (req, res) => {
             [mesa_numero]
         );
 
-        if (mesaRes.rows.length > 0) {
-            if (
-                !mesaRes.rows[0].token_sessao ||
-                mesaRes.rows[0].token_sessao !== token_sessao
-            ) {
-                return res.status(403).json({
-                    error: 'Sessão inválida.'
-                });
-            }
-
-            await client.query(
-                `
-                    UPDATE mesas
-                    SET chamando_garcom = TRUE
-                    WHERE id = $1
-                `,
-                [mesaRes.rows[0].id]
-            );
-
-            atualizarPainel();
-
-            io.emit('chamada_garcom', {
-                mesa: mesa_numero
-            });
-
-            res.json({ success: true });
-        } else {
-            res.status(404).json({
+        if (mesaRes.rows.length === 0) {
+            return res.status(404).json({
                 error: 'Mesa não encontrada'
             });
         }
-    } catch (error) {
-        console.error(error);
 
-        res.status(500).json({
+        const mesa = mesaRes.rows[0];
+
+        if (
+            !mesa.token_sessao ||
+            mesa.token_sessao !== token_sessao
+        ) {
+            return res.status(403).json({
+                error: 'Sessão inválida.'
+            });
+        }
+
+        await client.query(
+            `
+                UPDATE mesas
+                SET chamando_garcom = TRUE
+                WHERE id = $1
+            `,
+            [mesa.id]
+        );
+
+        atualizarPainel();
+
+        io.emit('chamada_garcom', {
+            mesa: mesa_numero
+        });
+
+        return res.json({
+            success: true
+        });
+    } catch (error) {
+        console.error('Erro ao chamar garçom:', error);
+
+        return res.status(500).json({
             error: 'Erro ao chamar garçom'
         });
     } finally {
@@ -498,17 +525,19 @@ app.get('/api/caixa/status', verifyAdminToken, async (req, res) => {
         `);
 
         if (result.rows.length > 0) {
-            res.json({
+            return res.json({
                 aberto: true,
                 caixa: result.rows[0]
             });
-        } else {
-            res.json({ aberto: false });
         }
+
+        return res.json({
+            aberto: false
+        });
     } catch (error) {
         console.error('Erro ao verificar caixa:', error);
 
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Erro ao verificar status do caixa.'
         });
     }
@@ -521,9 +550,11 @@ app.post('/api/caixa/abrir', verifyAdminToken, async (req, res) => {
     const { saldo_inicial } = req.body;
 
     try {
-        const check = await pool.query(
-            "SELECT id FROM caixas WHERE status = 'aberto'"
-        );
+        const check = await pool.query(`
+            SELECT id
+            FROM caixas
+            WHERE status = 'aberto'
+        `);
 
         if (check.rows.length > 0) {
             return res.status(400).json({
@@ -544,14 +575,14 @@ app.post('/api/caixa/abrir', verifyAdminToken, async (req, res) => {
             [saldo_inicial || 0]
         );
 
-        res.json({
+        return res.json({
             success: true,
             caixa: result.rows[0]
         });
     } catch (error) {
         console.error('Erro ao abrir caixa:', error);
 
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Erro ao abrir caixa.'
         });
     }
@@ -564,7 +595,9 @@ app.post('/api/caixa/fechar', verifyAdminToken, async (req, res) => {
     try {
         const result = await pool.query(`
             UPDATE caixas
-            SET status = 'fechado', data_fechamento = NOW()
+            SET
+                status = 'fechado',
+                data_fechamento = NOW()
             WHERE status = 'aberto'
             RETURNING *
         `);
@@ -575,14 +608,14 @@ app.post('/api/caixa/fechar', verifyAdminToken, async (req, res) => {
             });
         }
 
-        res.json({
+        return res.json({
             success: true,
             caixa: result.rows[0]
         });
     } catch (error) {
         console.error('Erro ao fechar caixa:', error);
 
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Erro ao fechar caixa.'
         });
     }
@@ -602,14 +635,18 @@ app.get('/api/caixa/resumo', verifyAdminToken, async (req, res) => {
         `);
 
         if (caixaAberto.rows.length === 0) {
-            return res.json({ aberto: false });
+            return res.json({
+                aberto: false
+            });
         }
 
         const caixa = caixaAberto.rows[0];
 
         const vendas = await pool.query(
             `
-                SELECT forma_pagamento, SUM(valor) AS total
+                SELECT
+                    forma_pagamento,
+                    SUM(valor) AS total
                 FROM comanda_pagamentos
                 WHERE caixa_id = $1
                 GROUP BY forma_pagamento
@@ -617,22 +654,22 @@ app.get('/api/caixa/resumo', verifyAdminToken, async (req, res) => {
             [caixa.id]
         );
 
-        res.json({
+        return res.json({
             aberto: true,
-            caixa: caixa,
+            caixa,
             vendas: vendas.rows
         });
     } catch (error) {
         console.error('Erro no resumo do caixa:', error);
 
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Erro ao obter resumo do caixa.'
         });
     }
 });
 
 // ==========================================
-// ATENDER CHAMADA DO GARÇOM
+// ATENDER CHAMADA DE GARÇOM
 // ==========================================
 app.post('/api/garcom/atender', verifyAdminToken, async (req, res) => {
     try {
@@ -647,16 +684,18 @@ app.post('/api/garcom/atender', verifyAdminToken, async (req, res) => {
 
         atualizarPainel();
 
-        res.json({ success: true });
+        return res.json({
+            success: true
+        });
     } catch (error) {
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Erro ao atender garçom'
         });
     }
 });
 
 // ==========================================
-// LISTAR MESAS
+// LISTAR MESAS E COMANDAS
 // ==========================================
 app.get('/api/mesas', verifyAdminToken, async (req, res) => {
     try {
@@ -697,9 +736,9 @@ app.get('/api/mesas', verifyAdminToken, async (req, res) => {
 
         const mesasRes = await pool.query(query);
 
-        res.json(mesasRes.rows);
+        return res.json(mesasRes.rows);
     } catch (error) {
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Erro ao buscar mesas'
         });
     }
@@ -709,14 +748,13 @@ app.get('/api/mesas', verifyAdminToken, async (req, res) => {
 // CHECKOUT COM PAGAMENTOS MÚLTIPLOS
 // ==========================================
 app.post('/api/checkout', verifyAdminToken, async (req, res) => {
-    let {
+    const {
         comanda_id,
         mesa_id,
         pagamentos,
         subtotal,
         taxa,
-        desconto,
-        final
+        desconto
     } = req.body;
 
     let client;
@@ -763,20 +801,21 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
 
             const itensSum = await client.query(
                 `
-                    SELECT SUM(quantidade * preco_unitario) AS soma
+                    SELECT
+                        SUM(quantidade * preco_unitario) AS soma
                     FROM comanda_itens
                     WHERE comanda_id = $1
                 `,
                 [comandaTargetId]
             );
 
-            let comSubtotal =
+            const comSubtotal =
                 itensSum.rows[0]?.soma || subtotal || 0;
 
-            let comFinal =
+            const comFinal =
                 comSubtotal - (desconto || 0) + (taxa || 0);
 
-            let formaPagamentoPrincipal =
+            const formaPagamentoPrincipal =
                 req.body.forma_pagamento || 'MULTIPLOS';
 
             await client.query(
@@ -805,7 +844,7 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
             );
 
             if (pagamentos && pagamentos.length > 0) {
-                for (const p of pagamentos) {
+                for (const pagamento of pagamentos) {
                     await client.query(
                         `
                             INSERT INTO comanda_pagamentos (
@@ -819,8 +858,8 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
                         [
                             comandaTargetId,
                             caixaId,
-                            p.metodo,
-                            p.valor
+                            pagamento.metodo,
+                            pagamento.valor
                         ]
                     );
                 }
@@ -863,13 +902,15 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
 
         atualizarPainel();
 
-        res.json({ success: true });
+        return res.json({
+            success: true
+        });
     } catch (error) {
         if (client) await client.query('ROLLBACK');
 
         console.error('Erro no checkout:', error);
 
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Erro ao fechar comanda'
         });
     } finally {
@@ -948,14 +989,14 @@ app.post(
 
             atualizarPainel();
 
-            res.json({
+            return res.json({
                 success: true,
                 message: 'Mesa cancelada.'
             });
         } catch (error) {
             if (client) await client.query('ROLLBACK');
 
-            res.status(500).json({
+            return res.status(500).json({
                 error: 'Erro ao cancelar'
             });
         } finally {
@@ -971,7 +1012,7 @@ app.post(
     '/api/admin/mesa/adicionar-itens',
     verifyAdminToken,
     async (req, res) => {
-        let { mesa_id, cart } = req.body;
+        const { mesa_id, cart } = req.body;
         let client;
 
         try {
@@ -1045,11 +1086,13 @@ app.post(
 
             atualizarPainel();
 
-            res.json({ success: true });
+            return res.json({
+                success: true
+            });
         } catch (error) {
             if (client) await client.query('ROLLBACK');
 
-            res.status(500).json({
+            return res.status(500).json({
                 error: 'Erro ao adicionar'
             });
         } finally {
@@ -1073,9 +1116,11 @@ app.delete(
 
             atualizarPainel();
 
-            res.json({ success: true });
+            return res.json({
+                success: true
+            });
         } catch (error) {
-            res.status(500).json({
+            return res.status(500).json({
                 error: 'Erro ao apagar'
             });
         }
@@ -1143,9 +1188,9 @@ app.get('/api/historico', verifyAdminToken, async (req, res) => {
 
         const result = await pool.query(query);
 
-        res.json(result.rows);
+        return res.json(result.rows);
     } catch (error) {
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Erro no histórico'
         });
     }
@@ -1262,7 +1307,7 @@ app.get('/api/estatisticas', verifyAdminToken, async (req, res) => {
             itensVendidos
         ]);
 
-        res.json({
+        return res.json({
             faturamento: {
                 dia: rFatDia.rows[0]?.total || 0,
                 semana: rFatSemana.rows[0]?.total || 0,
@@ -1278,25 +1323,33 @@ app.get('/api/estatisticas', verifyAdminToken, async (req, res) => {
     } catch (error) {
         console.error('Erro nas estatísticas:', error);
 
-        res.status(500).json({
+        return res.status(500).json({
             error: 'Erro nas estatísticas'
         });
     }
 });
 
 // ==========================================
-// DELIVERY: INICIALIZAÇÃO DA TABELA
+// DELIVERY: CRIAÇÃO AUTOMÁTICA DA TABELA
 // ==========================================
+// Guarda os dados preenchidos no formulário do cardápio,
+// os itens do pedido e a etapa atual do atendimento.
 const deliveryDBReady = pool.query(`
     CREATE TABLE IF NOT EXISTS pedidos_delivery (
         id SERIAL PRIMARY KEY,
+
         cliente JSONB NOT NULL,
         cliente_nome TEXT NOT NULL,
         endereco TEXT NOT NULL,
+
         itens JSONB NOT NULL,
+
         valor_total NUMERIC(12,2) NOT NULL
             CHECK (valor_total >= 0),
-        origem TEXT NOT NULL DEFAULT 'WHATSAPP_DELIVERY',
+
+        origem TEXT NOT NULL
+            DEFAULT 'WHATSAPP_DELIVERY',
+
         status TEXT NOT NULL DEFAULT 'novo'
             CHECK (
                 status IN (
@@ -1306,12 +1359,16 @@ const deliveryDBReady = pool.query(`
                     'entregue'
                 )
             ),
-        data_criacao TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        data_atualizacao TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+        data_criacao TIMESTAMPTZ NOT NULL
+            DEFAULT NOW(),
+
+        data_atualizacao TIMESTAMPTZ NOT NULL
+            DEFAULT NOW()
     )
 `).then(() => {
     return true;
-}).catch((error) => {
+}).catch(error => {
     console.error(
         'Erro ao inicializar tabela de delivery:',
         error
@@ -1322,7 +1379,9 @@ const deliveryDBReady = pool.query(`
 
 async function verificarDeliveryDB() {
     if (!await deliveryDBReady) {
-        throw new Error('Tabela de delivery indisponível');
+        throw new Error(
+            'Tabela de delivery indisponível'
+        );
     }
 }
 
@@ -1338,7 +1397,7 @@ app.post('/api/delivery/novo', async (req, res) => {
         !cliente.nome.trim() ||
         !Array.isArray(itens) ||
         itens.length === 0 ||
-        itens.some((item) =>
+        itens.some(item =>
             !item ||
             !Number.isInteger(item.quantity) ||
             item.quantity <= 0 ||
@@ -1352,6 +1411,8 @@ app.post('/api/delivery/novo', async (req, res) => {
         });
     }
 
+    // Calcula o total em centavos para evitar diferenças
+    // de arredondamento ao somar os itens.
     const totalCentavos = itens.reduce(
         (total, item) =>
             total +
@@ -1368,6 +1429,7 @@ app.post('/api/delivery/novo', async (req, res) => {
         });
     }
 
+    // Endereço montado com os campos preenchidos pelo cliente.
     const endereco = [
         [cliente.rua, cliente.numero]
             .filter(Boolean)
@@ -1413,7 +1475,7 @@ app.post('/api/delivery/novo', async (req, res) => {
             ]
         );
 
-        // Notifica o painel somente depois de salvar.
+        // Só confirma e notifica depois de salvar o pedido.
         io.emit('atualizacao_delivery');
 
         return res.status(201).json({
@@ -1421,7 +1483,10 @@ app.post('/api/delivery/novo', async (req, res) => {
             pedido: resultado.rows[0]
         });
     } catch (error) {
-        console.error('Erro ao salvar delivery:', error);
+        console.error(
+            'Erro ao salvar delivery:',
+            error
+        );
 
         return res.status(500).json({
             error: 'Não foi possível salvar o pedido.'
@@ -1432,6 +1497,9 @@ app.post('/api/delivery/novo', async (req, res) => {
 // ==========================================
 // DELIVERY: LISTAR PEDIDOS ATIVOS
 // ==========================================
+// O objeto "cliente" inclui nome, telefone, endereço
+// separado por campos e método de pagamento informado.
+// Os itens incluem nome, quantidade, preço e observações.
 app.get(
     '/api/delivery/listar',
     verifyAdminToken,
@@ -1442,6 +1510,7 @@ app.get(
             const resultado = await pool.query(`
                 SELECT
                     id,
+                    cliente,
                     cliente_nome,
                     endereco,
                     itens,
@@ -1460,7 +1529,10 @@ app.get(
 
             return res.json(resultado.rows);
         } catch (error) {
-            console.error('Erro ao listar delivery:', error);
+            console.error(
+                'Erro ao listar delivery:',
+                error
+            );
 
             return res.status(500).json({
                 error: 'Não foi possível carregar os pedidos.'
@@ -1470,8 +1542,10 @@ app.get(
 );
 
 // ==========================================
-// DELIVERY: ATUALIZAR STATUS
+// DELIVERY: ATUALIZAR ETAPA
 // ==========================================
+// Fluxo permitido:
+// novo -> preparo -> caminho -> entregue
 app.post(
     '/api/delivery/status',
     verifyAdminToken,
@@ -1503,7 +1577,8 @@ app.post(
                     SET
                         status = $1,
                         data_atualizacao = NOW()
-                    WHERE id = $2 AND status = $3
+                    WHERE id = $2
+                    AND status = $3
                     RETURNING id, status
                 `,
                 [status, id, anterior[status]]
