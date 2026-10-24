@@ -85,7 +85,7 @@ pool.on('error', err => {
 });
 
 // ==========================================
-// TABELA DE PAGAMENTOS
+// INICIALIZAÇÃO DA TABELA DE PAGAMENTOS
 // ==========================================
 async function initDB() {
     try {
@@ -163,7 +163,7 @@ function atualizarPainel() {
 }
 
 // ==========================================
-// LOGIN DO PAINEL
+// LOGIN
 // ==========================================
 app.post('/api/admin/login', (req, res) => {
     const { user, pass } = req.body;
@@ -301,7 +301,7 @@ app.post('/api/mesa/sessao', async (req, res) => {
 });
 
 // ==========================================
-// RECEBER PEDIDO DA MESA
+// RECEBER PEDIDO DO CARDÁPIO DA MESA
 // ==========================================
 app.post('/api/pedidos', async (req, res) => {
     const { mesa_numero, cart, token_sessao } = req.body;
@@ -763,6 +763,26 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
         client = await pool.connect();
         await client.query('BEGIN');
 
+        // Usa a mesma ordem de bloqueio das rotas de edição.
+        if (mesa_id) {
+            await client.query(
+                'SELECT id FROM mesas WHERE id = $1 FOR UPDATE',
+                [mesa_id]
+            );
+        } else if (comanda_id) {
+            const referenciaMesa = await client.query(
+                'SELECT mesa_id FROM comandas WHERE id = $1',
+                [comanda_id]
+            );
+
+            if (referenciaMesa.rows[0]?.mesa_id) {
+                await client.query(
+                    'SELECT id FROM mesas WHERE id = $1 FOR UPDATE',
+                    [referenciaMesa.rows[0].mesa_id]
+                );
+            }
+        }
+
         let comandaTargetId = comanda_id;
 
         if (mesa_id && !comanda_id) {
@@ -921,105 +941,35 @@ app.post('/api/checkout', verifyAdminToken, async (req, res) => {
 // ==========================================
 // CANCELAR MESA/COMANDA
 // ==========================================
-app.post(
-    '/api/admin/mesa/cancelar',
-    verifyAdminToken,
-    async (req, res) => {
-        let { mesa_id, comanda_id } = req.body;
-        let client;
+app.post('/api/admin/mesa/cancelar', verifyAdminToken, async (req, res) => {
+    let { mesa_id, comanda_id } = req.body;
+    let client;
 
-        try {
-            client = await pool.connect();
-            await client.query('BEGIN');
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
 
-            if (!comanda_id && mesa_id) {
-                const comRes = await client.query(
-                    `
-                        SELECT id
-                        FROM comandas
-                        WHERE mesa_id = $1
-                        AND LOWER(status) = 'aberta'
-                    `,
-                    [mesa_id]
-                );
+        if (mesa_id) {
+            await client.query(
+                'SELECT id FROM mesas WHERE id = $1 FOR UPDATE',
+                [mesa_id]
+            );
+        } else if (comanda_id) {
+            const referenciaMesa = await client.query(
+                'SELECT mesa_id FROM comandas WHERE id = $1',
+                [comanda_id]
+            );
 
-                if (comRes.rows.length > 0) {
-                    comanda_id = comRes.rows[0].id;
-                }
-            }
-
-            if (comanda_id) {
+            if (referenciaMesa.rows[0]?.mesa_id) {
                 await client.query(
-                    `
-                        DELETE FROM comanda_pagamentos
-                        WHERE comanda_id = $1
-                    `,
-                    [comanda_id]
-                );
-
-                await client.query(
-                    `
-                        DELETE FROM comanda_itens
-                        WHERE comanda_id = $1
-                    `,
-                    [comanda_id]
-                );
-
-                await client.query(
-                    'DELETE FROM comandas WHERE id = $1',
-                    [comanda_id]
+                    'SELECT id FROM mesas WHERE id = $1 FOR UPDATE',
+                    [referenciaMesa.rows[0].mesa_id]
                 );
             }
-
-            if (mesa_id) {
-                await client.query(
-                    `
-                        UPDATE mesas
-                        SET
-                            status = $1,
-                            chamando_garcom = FALSE,
-                            token_sessao = NULL
-                        WHERE id = $2
-                    `,
-                    ['livre', mesa_id]
-                );
-            }
-
-            await client.query('COMMIT');
-
-            atualizarPainel();
-
-            return res.json({
-                success: true,
-                message: 'Mesa cancelada.'
-            });
-        } catch (error) {
-            if (client) await client.query('ROLLBACK');
-
-            return res.status(500).json({
-                error: 'Erro ao cancelar'
-            });
-        } finally {
-            if (client) client.release();
         }
-    }
-);
 
-// ==========================================
-// ADICIONAR ITENS PELO PAINEL
-// ==========================================
-app.post(
-    '/api/admin/mesa/adicionar-itens',
-    verifyAdminToken,
-    async (req, res) => {
-        const { mesa_id, cart } = req.body;
-        let client;
-
-        try {
-            client = await pool.connect();
-            await client.query('BEGIN');
-
-            const comandaRes = await client.query(
+        if (!comanda_id && mesa_id) {
+            const comRes = await client.query(
                 `
                     SELECT id
                     FROM comandas
@@ -1029,33 +979,205 @@ app.post(
                 [mesa_id]
             );
 
-            let comanda_id;
+            if (comRes.rows.length > 0) {
+                comanda_id = comRes.rows[0].id;
+            }
+        }
 
-            if (comandaRes.rows.length === 0) {
-                const codigo =
-                    `#${Math.floor(100 + Math.random() * 900)}`;
+        if (comanda_id) {
+            await client.query(
+                `
+                    DELETE FROM comanda_pagamentos
+                    WHERE comanda_id = $1
+                `,
+                [comanda_id]
+            );
 
-                const novaComanda = await client.query(
+            await client.query(
+                `
+                    DELETE FROM comanda_itens
+                    WHERE comanda_id = $1
+                `,
+                [comanda_id]
+            );
+
+            await client.query(
+                'DELETE FROM comandas WHERE id = $1',
+                [comanda_id]
+            );
+        }
+
+        if (mesa_id) {
+            await client.query(
+                `
+                    UPDATE mesas
+                    SET
+                        status = $1,
+                        chamando_garcom = FALSE,
+                        token_sessao = NULL
+                    WHERE id = $2
+                `,
+                ['livre', mesa_id]
+            );
+        }
+
+        await client.query('COMMIT');
+
+        atualizarPainel();
+
+        return res.json({
+            success: true,
+            message: 'Mesa cancelada.'
+        });
+    } catch (error) {
+        if (client) await client.query('ROLLBACK');
+
+        return res.status(500).json({
+            error: 'Erro ao cancelar'
+        });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+// ==========================================
+// APOIO À EDIÇÃO DE COMANDAS
+// ==========================================
+function erroEdicaoMesa(status, mensagem) {
+    return Object.assign(
+        new Error(mensagem),
+        { status }
+    );
+}
+
+function inteiroPositivo(valor) {
+    return Number.isSafeInteger(valor) && valor > 0;
+}
+
+// ==========================================
+// LANÇAR PEDIDO MANUAL NA MESA
+// ==========================================
+app.post(
+    '/api/admin/mesa/adicionar-itens',
+    verifyAdminToken,
+    async (req, res) => {
+        const {
+            mesa_id,
+            cart,
+            comanda_id
+        } = req.body || {};
+
+        if (
+            !inteiroPositivo(mesa_id) ||
+            !Array.isArray(cart) ||
+            !cart.length ||
+            cart.some(item =>
+                !item ||
+                typeof item.name !== 'string' ||
+                !item.name.trim() ||
+                !inteiroPositivo(item.quantity) ||
+                typeof item.unitPrice !== 'number' ||
+                !Number.isFinite(item.unitPrice) ||
+                item.unitPrice < 0 ||
+                item.unitPrice > 99999999.99 ||
+                (
+                    item.notes !== undefined &&
+                    typeof item.notes !== 'string'
+                )
+            )
+        ) {
+            return res.status(400).json({
+                error: 'Mesa ou itens inválidos.'
+            });
+        }
+
+        if (
+            Object.hasOwn(req.body, 'comanda_id') &&
+            comanda_id !== null &&
+            !inteiroPositivo(comanda_id)
+        ) {
+            return res.status(400).json({
+                error: 'Comanda inválida.'
+            });
+        }
+
+        let client;
+
+        try {
+            client = await pool.connect();
+            await client.query('BEGIN');
+
+            const mesa = await client.query(
+                `
+                    SELECT id
+                    FROM mesas
+                    WHERE id = $1
+                    FOR UPDATE
+                `,
+                [mesa_id]
+            );
+
+            if (!mesa.rows.length) {
+                throw erroEdicaoMesa(
+                    404,
+                    'Mesa não encontrada.'
+                );
+            }
+
+            const aberta = await client.query(
+                `
+                    SELECT id
+                    FROM comandas
+                    WHERE mesa_id = $1
+                    AND (
+                        LOWER(status) = 'aberta'
+                        OR status IS NULL
+                    )
+                    AND data_fechamento IS NULL
+                    ORDER BY id DESC
+                    FOR UPDATE
+                `,
+                [mesa_id]
+            );
+
+            if (aberta.rows.length > 1) {
+                throw erroEdicaoMesa(
+                    409,
+                    'Há mais de uma comanda aberta nesta mesa.'
+                );
+            }
+
+            let comandaId = aberta.rows[0]?.id || null;
+
+            if (
+                Object.hasOwn(req.body, 'comanda_id') &&
+                comanda_id !== comandaId
+            ) {
+                throw erroEdicaoMesa(
+                    409,
+                    'A comanda desta mesa mudou. Atualize a mesa e confira o pedido antes de reenviar.'
+                );
+            }
+
+            // Se a mesa estiver vazia, cria a comanda.
+            if (!comandaId) {
+                const nova = await client.query(
                     `
                         INSERT INTO comandas (
                             codigo,
                             mesa_id,
                             status
                         )
-                        VALUES ($1, $2, $3)
+                        VALUES ($1, $2, 'aberta')
                         RETURNING id
                     `,
-                    [codigo, mesa_id, 'aberta']
+                    [
+                        `#${Math.floor(100 + Math.random() * 900)}`,
+                        mesa_id
+                    ]
                 );
 
-                comanda_id = novaComanda.rows[0].id;
-
-                await client.query(
-                    'UPDATE mesas SET status = $1 WHERE id = $2',
-                    ['ocupada', mesa_id]
-                );
-            } else {
-                comanda_id = comandaRes.rows[0].id;
+                comandaId = nova.rows[0].id;
             }
 
             for (const item of cart) {
@@ -1072,28 +1194,45 @@ app.post(
                         VALUES ($1, $2, $3, $4, $5, $6)
                     `,
                     [
-                        comanda_id,
-                        item.dishId || 'item',
-                        item.name,
+                        comandaId,
+                        String(item.dishId || 'item'),
+                        item.name.trim(),
                         item.quantity,
-                        item.unitPrice,
+                        Math.round(item.unitPrice * 100) / 100,
                         item.notes || ''
                     ]
                 );
             }
+
+            await client.query(
+                `
+                    UPDATE mesas
+                    SET status = 'ocupada'
+                    WHERE id = $1
+                `,
+                [mesa_id]
+            );
 
             await client.query('COMMIT');
 
             atualizarPainel();
 
             return res.json({
-                success: true
+                success: true,
+                comanda_id: comandaId
             });
         } catch (error) {
             if (client) await client.query('ROLLBACK');
 
-            return res.status(500).json({
-                error: 'Erro ao adicionar'
+            console.error(
+                'Erro ao adicionar itens pelo painel:',
+                error
+            );
+
+            return res.status(error.status || 500).json({
+                error: error.status
+                    ? error.message
+                    : 'Erro ao adicionar itens.'
             });
         } finally {
             if (client) client.release();
@@ -1102,29 +1241,180 @@ app.post(
 );
 
 // ==========================================
-// REMOVER ITEM DA COMANDA
+// ALTERAR QUANTIDADE OU REMOVER ITEM
 // ==========================================
+async function editarItemDaMesa(req, res, remover) {
+    const id = Number(req.params.id);
+    const dados = req.body || {};
+
+    if (
+        !inteiroPositivo(id) ||
+        (!remover && !inteiroPositivo(dados.quantidade))
+    ) {
+        return res.status(400).json({
+            error: 'Item ou quantidade inválida.'
+        });
+    }
+
+    let client;
+
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
+
+        const referencia = await client.query(
+            `
+                SELECT
+                    ci.comanda_id,
+                    c.mesa_id
+                FROM comanda_itens ci
+                JOIN comandas c
+                    ON c.id = ci.comanda_id
+                WHERE ci.id = $1
+            `,
+            [id]
+        );
+
+        if (!referencia.rows.length) {
+            throw erroEdicaoMesa(
+                404,
+                'Item não encontrado. Atualize a mesa.'
+            );
+        }
+
+        const {
+            comanda_id,
+            mesa_id
+        } = referencia.rows[0];
+
+        if (
+            (
+                dados.mesa_id !== undefined &&
+                dados.mesa_id !== mesa_id
+            ) ||
+            (
+                dados.comanda_id !== undefined &&
+                dados.comanda_id !== comanda_id
+            )
+        ) {
+            throw erroEdicaoMesa(
+                409,
+                'O item não pertence à comanda selecionada.'
+            );
+        }
+
+        await client.query(
+            `
+                SELECT id
+                FROM mesas
+                WHERE id = $1
+                FOR UPDATE
+            `,
+            [mesa_id]
+        );
+
+        const comanda = await client.query(
+            `
+                SELECT id
+                FROM comandas
+                WHERE id = $1
+                AND (
+                    LOWER(status) = 'aberta'
+                    OR status IS NULL
+                )
+                AND data_fechamento IS NULL
+                FOR UPDATE
+            `,
+            [comanda_id]
+        );
+
+        if (!comanda.rows.length) {
+            throw erroEdicaoMesa(
+                409,
+                'Esta comanda já foi fechada ou cancelada.'
+            );
+        }
+
+        const item = await client.query(
+            `
+                SELECT quantidade
+                FROM comanda_itens
+                WHERE id = $1
+                FOR UPDATE
+            `,
+            [id]
+        );
+
+        if (!item.rows.length) {
+            throw erroEdicaoMesa(
+                404,
+                'Item já removido. Atualize a mesa.'
+            );
+        }
+
+        if (
+            dados.quantidade_anterior !== undefined &&
+            dados.quantidade_anterior !== item.rows[0].quantidade
+        ) {
+            throw erroEdicaoMesa(
+                409,
+                'A quantidade já foi alterada. Confira a mesa antes de tentar novamente.'
+            );
+        }
+
+        if (remover) {
+            await client.query(
+                'DELETE FROM comanda_itens WHERE id = $1',
+                [id]
+            );
+        } else {
+            await client.query(
+                `
+                    UPDATE comanda_itens
+                    SET quantidade = $1
+                    WHERE id = $2
+                `,
+                [dados.quantidade, id]
+            );
+        }
+
+        // Ao remover o último item, mantém a comanda aberta
+        // até o operador cancelá-la ou lançar novos itens.
+        await client.query('COMMIT');
+
+        atualizarPainel();
+
+        return res.json({
+            success: true
+        });
+    } catch (error) {
+        if (client) await client.query('ROLLBACK');
+
+        console.error(
+            'Erro ao editar item da mesa:',
+            error
+        );
+
+        return res.status(error.status || 500).json({
+            error: error.status
+                ? error.message
+                : 'Erro ao editar item.'
+        });
+    } finally {
+        if (client) client.release();
+    }
+}
+
+app.put(
+    '/api/admin/comanda-item/:id',
+    verifyAdminToken,
+    (req, res) => editarItemDaMesa(req, res, false)
+);
+
 app.delete(
     '/api/admin/comanda-item/:id',
     verifyAdminToken,
-    async (req, res) => {
-        try {
-            await pool.query(
-                'DELETE FROM comanda_itens WHERE id = $1',
-                [req.params.id]
-            );
-
-            atualizarPainel();
-
-            return res.json({
-                success: true
-            });
-        } catch (error) {
-            return res.status(500).json({
-                error: 'Erro ao apagar'
-            });
-        }
-    }
+    (req, res) => editarItemDaMesa(req, res, true)
 );
 
 // ==========================================
@@ -1160,7 +1450,8 @@ app.get('/api/historico', verifyAdminToken, async (req, res) => {
                     '[]'::json
                 ) AS items
             FROM comandas c
-            LEFT JOIN mesas m ON c.mesa_id = m.id
+            LEFT JOIN mesas m
+                ON c.mesa_id = m.id
             WHERE (
                 LOWER(c.status) = 'fechada'
                 OR c.data_fechamento IS NOT NULL
@@ -1284,7 +1575,8 @@ app.get('/api/estatisticas', verifyAdminToken, async (req, res) => {
                 ci.nome_item,
                 SUM(ci.quantidade) AS total_qtd
             FROM comanda_itens ci
-            JOIN comandas c ON ci.comanda_id = c.id
+            JOIN comandas c
+                ON ci.comanda_id = c.id
             WHERE (
                 LOWER(c.status) = 'fechada'
                 OR c.data_fechamento IS NOT NULL
@@ -1330,18 +1622,14 @@ app.get('/api/estatisticas', verifyAdminToken, async (req, res) => {
 });
 
 // ==========================================
-// DELIVERY: CRIAÇÃO AUTOMÁTICA DA TABELA
+// DELIVERY: CRIAÇÃO DA TABELA
 // ==========================================
-// Guarda os dados preenchidos no formulário do cardápio,
-// os itens do pedido e a etapa atual do atendimento.
 const deliveryDBReady = pool.query(`
     CREATE TABLE IF NOT EXISTS pedidos_delivery (
         id SERIAL PRIMARY KEY,
-
         cliente JSONB NOT NULL,
         cliente_nome TEXT NOT NULL,
         endereco TEXT NOT NULL,
-
         itens JSONB NOT NULL,
 
         valor_total NUMERIC(12,2) NOT NULL
@@ -1411,8 +1699,6 @@ app.post('/api/delivery/novo', async (req, res) => {
         });
     }
 
-    // Calcula o total em centavos para evitar diferenças
-    // de arredondamento ao somar os itens.
     const totalCentavos = itens.reduce(
         (total, item) =>
             total +
@@ -1429,7 +1715,6 @@ app.post('/api/delivery/novo', async (req, res) => {
         });
     }
 
-    // Endereço montado com os campos preenchidos pelo cliente.
     const endereco = [
         [cliente.rua, cliente.numero]
             .filter(Boolean)
@@ -1475,7 +1760,6 @@ app.post('/api/delivery/novo', async (req, res) => {
             ]
         );
 
-        // Só confirma e notifica depois de salvar o pedido.
         io.emit('atualizacao_delivery');
 
         return res.status(201).json({
@@ -1483,10 +1767,7 @@ app.post('/api/delivery/novo', async (req, res) => {
             pedido: resultado.rows[0]
         });
     } catch (error) {
-        console.error(
-            'Erro ao salvar delivery:',
-            error
-        );
+        console.error('Erro ao salvar delivery:', error);
 
         return res.status(500).json({
             error: 'Não foi possível salvar o pedido.'
@@ -1497,9 +1778,6 @@ app.post('/api/delivery/novo', async (req, res) => {
 // ==========================================
 // DELIVERY: LISTAR PEDIDOS ATIVOS
 // ==========================================
-// O objeto "cliente" inclui nome, telefone, endereço
-// separado por campos e método de pagamento informado.
-// Os itens incluem nome, quantidade, preço e observações.
 app.get(
     '/api/delivery/listar',
     verifyAdminToken,
@@ -1544,8 +1822,6 @@ app.get(
 // ==========================================
 // DELIVERY: ATUALIZAR ETAPA
 // ==========================================
-// Fluxo permitido:
-// novo -> preparo -> caminho -> entregue
 app.post(
     '/api/delivery/status',
     verifyAdminToken,
