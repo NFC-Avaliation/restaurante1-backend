@@ -4,8 +4,8 @@ const { Server } = require('socket.io');
 const { Pool } = require('pg');
 const cors = require('cors');
 const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
-const rateLimit = require('express-rate-limit');
+const jwt = require('jsonwebtoken'); // Para autenticação real do Admin
+const rateLimit = require('express-rate-limit'); // Contra ataques de Spam/DDoS
 
 const app = express();
 const server = http.createServer(app);
@@ -13,10 +13,9 @@ const server = http.createServer(app);
 app.set('trust proxy', 1);
 
 // ==========================================
-// CORS
+// 1. TRAVA DE SEGURANÇA: CORS RESTRITO
 // ==========================================
-const FRONTEND_URL =
-    process.env.FRONTEND_URL || 'https://nfc-avaliation.github.io';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://nfc-avaliation.github.io';
 
 const allowedOrigins = [
     'http://localhost:3000',
@@ -40,53 +39,41 @@ app.use(cors(corsOptions));
 app.use(express.json());
 
 // ==========================================
-// LIMITE DE REQUISIÇÕES
+// 2. TRAVA DE SEGURANÇA: RATE LIMITING (Anti-DDoS)
 // ==========================================
 const apiLimiter = rateLimit({
-    windowMs: 60 * 1000,
+    windowMs: 1 * 60 * 1000, // 1 minuto
     max: 100,
-    message: {
-        error: 'Muitas requisições originadas deste IP. Aguarde um minuto.'
-    },
-    validate: {
-        trustProxy: false
-    }
+    message: { error: 'Muitas requisições originadas deste IP. Aguarde um minuto.' },
+    validate: { trustProxy: false }
 });
-
 app.use('/api/', apiLimiter);
 
-// ==========================================
-// SOCKET.IO
-// ==========================================
+// Configuração do Socket.io
 const io = new Server(server, {
     cors: {
         origin: allowedOrigins,
-        methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+        methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
         credentials: true
     }
 });
 
-// ==========================================
-// BANCO DE DADOS
-// ==========================================
+// Configurações do Banco de Dados
 const pool = new Pool({
-    connectionString:
-        process.env.DATABASE_URL ||
-        'postgresql://postgres:JTSZTBKgDTGCZ5LF@db.jfyjrtllkqmvixosrtof.supabase.co:5432/postgres',
-    ssl: {
-        rejectUnauthorized: false
-    },
+    connectionString: process.env.DATABASE_URL || 'postgresql://postgres:JTSZTBKgDTGCZ5LF@db.jfyjrtllkqmvixosrtof.supabase.co:5432/postgres',
+    ssl: { rejectUnauthorized: false },
     max: 20,
     idleTimeoutMillis: 30000
 });
 
-pool.on('error', err => {
+pool.on('error', (err) => {
     console.error('Erro inesperado no banco de dados:', err);
 });
 
 // ==========================================
-// INICIALIZAÇÃO DA TABELA DE PAGAMENTOS
+// INICIALIZAÇÃO DA BASE DE DADOS (AUTO-MIGRATION)
 // ==========================================
+// Esta função cria a tabela de múltiplos pagamentos automaticamente caso não exista!
 async function initDB() {
     try {
         await pool.query(`
@@ -99,63 +86,100 @@ async function initDB() {
                 data_pagamento TIMESTAMP DEFAULT NOW()
             );
         `);
-
-        console.log(
-            "Tabela 'comanda_pagamentos' verificada/criada com sucesso."
-        );
+        console.log("✅ Tabela 'comanda_pagamentos' verificada/criada com sucesso!");
     } catch (err) {
-        console.error(
-            'Erro ao criar tabela de pagamentos múltiplos:',
-            err
-        );
+        console.error("❌ Erro ao criar tabela de pagamentos múltiplos:", err);
     }
 }
-
 initDB();
 
-// ==========================================
-// CREDENCIAIS DO ADMINISTRADOR
-// ==========================================
+// Registro persistente dos pedidos de mesa e das quantidades impressas.
+const impressaoDBReady = pool.query(`
+    ALTER TABLE comanda_itens
+        ADD COLUMN IF NOT EXISTS pedido_lote UUID,
+        ADD COLUMN IF NOT EXISTS quantidade_impressa INTEGER NOT NULL DEFAULT 0
+`).then(() => true).catch(error => {
+    console.error('Erro ao preparar controle de impressão:', error);
+    return false;
+});
+
+async function verificarImpressaoDB() {
+    if (!await impressaoDBReady) throw new Error('Controle de impressão indisponível.');
+}
+
+app.post('/api/admin/mesa/impressao', verifyAdminToken, async (req, res) => {
+    const { mesa_id, comanda_id, itens } = req.body || {};
+    if (!inteiroPositivo(mesa_id) || !inteiroPositivo(comanda_id) ||
+        !Array.isArray(itens) || !itens.length ||
+        itens.some(i => !i || !inteiroPositivo(i.id) || !inteiroPositivo(i.quantidade) || i.quantidade > 2147483647) ||
+        new Set(itens.map(i => i.id)).size !== itens.length) {
+        return res.status(400).json({ error: 'Mesa, comanda ou itens inválidos.' });
+    }
+    let client;
+    try {
+        await verificarImpressaoDB();
+        client = await pool.connect();
+        await client.query('BEGIN');
+        await client.query('SELECT id FROM mesas WHERE id = $1 FOR UPDATE', [mesa_id]);
+        const comanda = await client.query(`
+            SELECT id FROM comandas WHERE id = $1 AND mesa_id = $2
+            AND (LOWER(status) = 'aberta' OR status IS NULL)
+            AND data_fechamento IS NULL FOR UPDATE
+        `, [comanda_id, mesa_id]);
+        if (!comanda.rows.length) throw erroEdicaoMesa(409, 'Esta comanda já foi fechada ou alterada.');
+        const encontrados = await client.query(`
+            SELECT id FROM comanda_itens
+            WHERE comanda_id = $1 AND id = ANY($2::int[]) FOR UPDATE
+        `, [comanda_id, itens.map(i => i.id)]);
+        if (encontrados.rows.length !== itens.length) {
+            throw erroEdicaoMesa(409, 'Os itens da comanda mudaram. Atualize a mesa e confira a impressão.');
+        }
+        for (const item of itens) {
+            // Quantidade absoluta do retrato impresso: repetição não soma duas vezes.
+            // Um acréscimo recebido enquanto se imprime continua pendente.
+            await client.query(`
+                UPDATE comanda_itens
+                SET quantidade_impressa = GREATEST(quantidade_impressa, LEAST(quantidade, $1))
+                WHERE id = $2 AND comanda_id = $3
+            `, [item.quantidade, item.id, comanda_id]);
+        }
+        await client.query('COMMIT');
+        atualizarPainel();
+        res.json({ success: true });
+    } catch (error) {
+        if (client) await client.query('ROLLBACK');
+        console.error('Erro ao confirmar impressão:', error);
+        res.status(error.status || 500).json({ error: error.status ? error.message : 'Não foi possível registrar a impressão.' });
+    } finally {
+        if (client) client.release();
+    }
+});
+
+
+// Credenciais de Admin Seguras
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'admin123';
-
-const JWT_SECRET =
-    process.env.JWT_SECRET || 'chave_super_secreta_restaurante_2026';
+const JWT_SECRET = process.env.JWT_SECRET || 'chave_super_secreta_restaurante_2026';
 
 // ==========================================
-// AUTENTICAÇÃO
+// 3. TRAVA DE SEGURANÇA: MIDDLEWARE JWT
 // ==========================================
 function verifyAdminToken(req, res, next) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
 
-    if (!token) {
-        return res.status(401).json({
-            error: 'Acesso negado. Token ausente.'
-        });
-    }
+    if (!token) return res.status(401).json({ error: 'Acesso negado. Token ausente.' });
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) {
-            return res.status(403).json({
-                error: 'Token inválido ou expirado. Faça login novamente.'
-            });
-        }
-
+        if (err) return res.status(403).json({ error: 'Token inválido ou expirado. Faça login novamente.' });
         req.user = user;
         next();
     });
 }
 
-// ==========================================
-// CONEXÕES EM TEMPO REAL
-// ==========================================
-io.on('connection', socket => {
+io.on('connection', (socket) => {
     console.log(`Cliente conectado: ${socket.id}`);
-
-    socket.on('disconnect', () => {
-        console.log(`Cliente desconectado: ${socket.id}`);
-    });
+    socket.on('disconnect', () => console.log(`Cliente desconectado: ${socket.id}`));
 });
 
 function atualizarPainel() {
@@ -163,1447 +187,562 @@ function atualizarPainel() {
 }
 
 // ==========================================
-// LOGIN
+// ROTA DE LOGIN DO PAINEL
 // ==========================================
 app.post('/api/admin/login', (req, res) => {
     const { user, pass } = req.body;
-
     if (user === ADMIN_USER && pass === ADMIN_PASS) {
-        const token = jwt.sign(
-            { role: 'admin' },
-            JWT_SECRET,
-            { expiresIn: '12h' }
-        );
-
-        return res.json({
-            success: true,
-            token
-        });
+        const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '12h' });
+        return res.json({ success: true, token });
     }
-
-    return res.status(401).json({
-        error: 'Utilizador ou senha incorretos!'
-    });
+    res.status(401).json({ error: 'Utilizador ou senha incorretos!' });
 });
 
 // ==========================================
-// ACESSAR MESA
+// ROTAS PÚBLICAS (CLIENTES NA MESA)
 // ==========================================
 app.get('/api/mesa/acessar', async (req, res) => {
     const { mesa } = req.query;
-
-    if (!mesa) {
-        return res.status(400).send(
-            'Número da mesa não especificado.'
-        );
-    }
+    if (!mesa) return res.status(400).send('Número da mesa não especificado.');
 
     let client;
-
     try {
         client = await pool.connect();
+        const mesaRes = await client.query('SELECT id, status, token_sessao FROM mesas WHERE numero::text = $1', [mesa]);
+        
+        if (mesaRes.rows.length === 0) return res.status(404).send('Mesa não encontrada no sistema.');
 
-        const mesaRes = await client.query(
-            `
-                SELECT id, status, token_sessao
-                FROM mesas
-                WHERE numero::text = $1
-            `,
-            [mesa]
-        );
-
-        if (mesaRes.rows.length === 0) {
-            return res.status(404).send(
-                'Mesa não encontrada no sistema.'
-            );
-        }
-
-        const mesaObj = mesaRes.rows[0];
+        let mesaObj = mesaRes.rows[0];
         let token = mesaObj.token_sessao;
 
         if (!token || mesaObj.status === 'livre') {
             token = 'tok_' + crypto.randomBytes(16).toString('hex');
-
-            await client.query(
-                `
-                    UPDATE mesas
-                    SET token_sessao = $1
-                    WHERE id = $2
-                `,
-                [token, mesaObj.id]
-            );
+            await client.query('UPDATE mesas SET token_sessao = $1 WHERE id = $2', [token, mesaObj.id]);
         }
 
-        return res.redirect(
-            `${FRONTEND_URL}/index.html?mesa=${mesa}&token=${token}`
-        );
+        res.redirect(`${FRONTEND_URL}/index.html?mesa=${mesa}&token=${token}`);
     } catch (error) {
-        return res.status(500).send(
-            'Erro interno ao acessar a mesa.'
-        );
+        res.status(500).send('Erro interno ao acessar a mesa.');
     } finally {
         if (client) client.release();
     }
 });
 
-// ==========================================
-// INICIAR SESSÃO DA MESA
-// ==========================================
 app.post('/api/mesa/sessao', async (req, res) => {
     const { mesa_numero } = req.body;
     let client;
-
     try {
         client = await pool.connect();
+        const mesaRes = await client.query('SELECT id, status, token_sessao FROM mesas WHERE numero::text = $1', [mesa_numero]);
+        if (mesaRes.rows.length === 0) return res.status(404).json({ error: 'Mesa não encontrada' });
 
-        const mesaRes = await client.query(
-            `
-                SELECT id, status, token_sessao
-                FROM mesas
-                WHERE numero::text = $1
-            `,
-            [mesa_numero]
-        );
-
-        if (mesaRes.rows.length === 0) {
-            return res.status(404).json({
-                error: 'Mesa não encontrada'
-            });
-        }
-
-        const mesa = mesaRes.rows[0];
+        let mesa = mesaRes.rows[0];
         let token = mesa.token_sessao;
 
         if (!token || mesa.status === 'livre') {
             token = 'tok_' + crypto.randomBytes(16).toString('hex');
-
-            await client.query(
-                `
-                    UPDATE mesas
-                    SET token_sessao = $1
-                    WHERE id = $2
-                `,
-                [token, mesa.id]
-            );
+            await client.query('UPDATE mesas SET token_sessao = $1 WHERE id = $2', [token, mesa.id]);
         }
-
-        return res.json({
-            success: true,
-            token_sessao: token
-        });
+        res.json({ success: true, token_sessao: token });
     } catch (error) {
-        return res.status(500).json({
-            error: 'Erro ao iniciar sessão'
-        });
+        res.status(500).json({ error: 'Erro ao iniciar sessão' });
     } finally {
         if (client) client.release();
     }
 });
 
-// ==========================================
-// RECEBER PEDIDO DO CARDÁPIO DA MESA
-// ==========================================
 app.post('/api/pedidos', async (req, res) => {
     const { mesa_numero, cart, token_sessao } = req.body;
-
-    if (!cart || !Array.isArray(cart) || cart.length === 0) {
-        return res.status(400).json({
-            error: 'Carrinho vazio'
-        });
-    }
+    if (!cart || !Array.isArray(cart) || cart.length === 0) return res.status(400).json({ error: 'Carrinho vazio' });
 
     let client;
-
     try {
+        await verificarImpressaoDB();
         client = await pool.connect();
         await client.query('BEGIN');
-
-        const mesaRes = await client.query(
-            `
-                SELECT id, token_sessao, status
-                FROM mesas
-                WHERE numero::text = $1
-                FOR UPDATE
-            `,
-            [mesa_numero]
-        );
-
-        if (mesaRes.rows.length === 0) {
-            throw new Error('MESA_NOT_FOUND');
-        }
-
+        
+        const mesaRes = await client.query('SELECT id, token_sessao, status FROM mesas WHERE numero::text = $1 FOR UPDATE', [mesa_numero]);
+        if (mesaRes.rows.length === 0) throw new Error('MESA_NOT_FOUND');
         const mesa = mesaRes.rows[0];
 
-        if (
-            !mesa.token_sessao ||
-            mesa.token_sessao !== token_sessao
-        ) {
-            throw new Error('INVALID_SESSION');
-        }
+        if (!mesa.token_sessao || mesa.token_sessao !== token_sessao) throw new Error('INVALID_SESSION');
 
-        const comandaRes = await client.query(
-            `
-                SELECT id
-                FROM comandas
-                WHERE mesa_id = $1
-                AND (
-                    LOWER(status) = 'aberta'
-                    OR status IS NULL
-                )
-            `,
-            [mesa.id]
-        );
-
+        let comandaRes = await client.query('SELECT id FROM comandas WHERE mesa_id = $1 AND (LOWER(status) = \'aberta\' OR status IS NULL)', [mesa.id]);
         let comanda_id;
 
         if (comandaRes.rows.length === 0) {
-            const codigo =
-                `#${Math.floor(100 + Math.random() * 900)}`;
-
-            const novaComanda = await client.query(
-                `
-                    INSERT INTO comandas (
-                        codigo,
-                        mesa_id,
-                        status
-                    )
-                    VALUES ($1, $2, $3)
-                    RETURNING id
-                `,
-                [codigo, mesa.id, 'aberta']
-            );
-
+            const codigo = `#${Math.floor(100 + Math.random() * 900)}`;
+            const novaComanda = await client.query('INSERT INTO comandas (codigo, mesa_id, status) VALUES ($1, $2, $3) RETURNING id', [codigo, mesa.id, 'aberta']);
             comanda_id = novaComanda.rows[0].id;
-
-            await client.query(
-                'UPDATE mesas SET status = $1 WHERE id = $2',
-                ['ocupada', mesa.id]
-            );
+            await client.query('UPDATE mesas SET status = $1 WHERE id = $2', ['ocupada', mesa.id]);
         } else {
             comanda_id = comandaRes.rows[0].id;
         }
 
+        const pedidoLote = crypto.randomUUID();
         for (const item of cart) {
             await client.query(
-                `
-                    INSERT INTO comanda_itens (
-                        comanda_id,
-                        item_id_cache,
-                        nome_item,
-                        quantidade,
-                        preco_unitario,
-                        observacoes
-                    )
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                `,
-                [
-                    comanda_id,
-                    item.dishId || 'item',
-                    item.name,
-                    item.quantity,
-                    item.unitPrice,
-                    item.notes || ''
-                ]
+                `INSERT INTO comanda_itens (comanda_id, item_id_cache, nome_item, quantidade, preco_unitario, observacoes, pedido_lote) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+                [comanda_id, item.dishId || 'item', item.name, item.quantity, item.unitPrice, item.notes || '', pedidoLote]
             );
         }
 
         await client.query('COMMIT');
-
         atualizarPainel();
+        io.emit('notificacao_painel', { titulo: 'Novo Pedido', msg: `Mesa ${mesa_numero} enviou um pedido.`, tipo: 'success' });
+        res.json({ success: true, message: 'Pedido enviado!' });
 
-        io.emit('notificacao_painel', {
-            titulo: 'Novo Pedido',
-            msg: `Mesa ${mesa_numero} enviou um pedido.`,
-            tipo: 'success'
-        });
-
-        return res.json({
-            success: true,
-            message: 'Pedido enviado!'
-        });
     } catch (error) {
         if (client) await client.query('ROLLBACK');
-
-        if (error.message === 'MESA_NOT_FOUND') {
-            return res.status(404).json({
-                error: 'Mesa não encontrada'
-            });
-        }
-
-        if (error.message === 'INVALID_SESSION') {
-            return res.status(403).json({
-                error: 'Sessão inválida'
-            });
-        }
-
-        console.error('Erro ao processar pedido da mesa:', error);
-
-        return res.status(500).json({
-            error: 'Erro ao processar pedido'
-        });
+        if (error.message === 'MESA_NOT_FOUND') return res.status(404).json({ error: 'Mesa não encontrada' });
+        if (error.message === 'INVALID_SESSION') return res.status(403).json({ error: 'Sessão inválida' });
+        
+        console.error('ERRO FATAL NO PEDIDO:', error);
+        res.status(500).json({ error: 'Erro ao processar pedido' });
     } finally {
         if (client) client.release();
     }
 });
 
-// ==========================================
-// CHAMAR GARÇOM
-// ==========================================
 app.post('/api/garcom', async (req, res) => {
     const { mesa_numero, token_sessao } = req.body;
     let client;
-
     try {
         client = await pool.connect();
-
-        const mesaRes = await client.query(
-            `
-                SELECT id, token_sessao
-                FROM mesas
-                WHERE numero::text = $1
-            `,
-            [mesa_numero]
-        );
-
-        if (mesaRes.rows.length === 0) {
-            return res.status(404).json({
-                error: 'Mesa não encontrada'
-            });
+        const mesaRes = await client.query('SELECT id, token_sessao FROM mesas WHERE numero::text = $1', [mesa_numero]);
+        if (mesaRes.rows.length > 0) {
+            if (!mesaRes.rows[0].token_sessao || mesaRes.rows[0].token_sessao !== token_sessao) {
+                return res.status(403).json({ error: 'Sessão inválida.' });
+            }
+            await client.query('UPDATE mesas SET chamando_garcom = TRUE WHERE id = $1', [mesaRes.rows[0].id]);
+            atualizarPainel();
+            io.emit('chamada_garcom', { mesa: mesa_numero });
+            res.json({ success: true });
+        } else {
+            res.status(404).json({ error: 'Mesa não encontrada' });
         }
-
-        const mesa = mesaRes.rows[0];
-
-        if (
-            !mesa.token_sessao ||
-            mesa.token_sessao !== token_sessao
-        ) {
-            return res.status(403).json({
-                error: 'Sessão inválida.'
-            });
-        }
-
-        await client.query(
-            `
-                UPDATE mesas
-                SET chamando_garcom = TRUE
-                WHERE id = $1
-            `,
-            [mesa.id]
-        );
-
-        atualizarPainel();
-
-        io.emit('chamada_garcom', {
-            mesa: mesa_numero
-        });
-
-        return res.json({
-            success: true
-        });
     } catch (error) {
-        console.error('Erro ao chamar garçom:', error);
-
-        return res.status(500).json({
-            error: 'Erro ao chamar garçom'
-        });
+        console.error(error);
+        res.status(500).json({ error: 'Erro ao chamar garçom' });
     } finally {
         if (client) client.release();
     }
 });
 
+
 // ==========================================
-// STATUS DO CAIXA
+// ROTAS DO MÓDULO DE CAIXA
 // ==========================================
+
 app.get('/api/caixa/status', verifyAdminToken, async (req, res) => {
     try {
-        const result = await pool.query(`
-            SELECT *
-            FROM caixas
-            WHERE status = 'aberto'
-            ORDER BY id DESC
-            LIMIT 1
-        `);
-
+        const result = await pool.query("SELECT * FROM caixas WHERE status = 'aberto' ORDER BY id DESC LIMIT 1");
         if (result.rows.length > 0) {
-            return res.json({
-                aberto: true,
-                caixa: result.rows[0]
-            });
+            res.json({ aberto: true, caixa: result.rows[0] });
+        } else {
+            res.json({ aberto: false });
         }
-
-        return res.json({
-            aberto: false
-        });
     } catch (error) {
         console.error('Erro ao verificar caixa:', error);
-
-        return res.status(500).json({
-            error: 'Erro ao verificar status do caixa.'
-        });
+        res.status(500).json({ error: 'Erro ao verificar status do caixa.' });
     }
 });
 
-// ==========================================
-// ABRIR CAIXA
-// ==========================================
 app.post('/api/caixa/abrir', verifyAdminToken, async (req, res) => {
     const { saldo_inicial } = req.body;
-
     try {
-        const check = await pool.query(`
-            SELECT id
-            FROM caixas
-            WHERE status = 'aberto'
-        `);
-
+        const check = await pool.query("SELECT id FROM caixas WHERE status = 'aberto'");
         if (check.rows.length > 0) {
-            return res.status(400).json({
-                error: 'Já existe um caixa aberto.'
-            });
+            return res.status(400).json({ error: 'Já existe um caixa aberto.' });
         }
-
         const result = await pool.query(
-            `
-                INSERT INTO caixas (
-                    status,
-                    saldo_inicial,
-                    data_abertura
-                )
-                VALUES ('aberto', $1, NOW())
-                RETURNING *
-            `,
+            "INSERT INTO caixas (status, saldo_inicial, data_abertura) VALUES ('aberto', $1, NOW()) RETURNING *",
             [saldo_inicial || 0]
         );
-
-        return res.json({
-            success: true,
-            caixa: result.rows[0]
-        });
+        res.json({ success: true, caixa: result.rows[0] });
     } catch (error) {
         console.error('Erro ao abrir caixa:', error);
-
-        return res.status(500).json({
-            error: 'Erro ao abrir caixa.'
-        });
+        res.status(500).json({ error: 'Erro ao abrir caixa.' });
     }
 });
 
-// ==========================================
-// FECHAR CAIXA
-// ==========================================
 app.post('/api/caixa/fechar', verifyAdminToken, async (req, res) => {
     try {
-        const result = await pool.query(`
-            UPDATE caixas
-            SET
-                status = 'fechado',
-                data_fechamento = NOW()
-            WHERE status = 'aberto'
-            RETURNING *
-        `);
-
+        const result = await pool.query(
+            "UPDATE caixas SET status = 'fechado', data_fechamento = NOW() WHERE status = 'aberto' RETURNING *"
+        );
         if (result.rowCount === 0) {
-            return res.status(400).json({
-                error: 'Nenhum caixa aberto encontrado.'
-            });
+            return res.status(400).json({ error: 'Nenhum caixa aberto encontrado.' });
         }
-
-        return res.json({
-            success: true,
-            caixa: result.rows[0]
-        });
+        res.json({ success: true, caixa: result.rows[0] });
     } catch (error) {
         console.error('Erro ao fechar caixa:', error);
-
-        return res.status(500).json({
-            error: 'Erro ao fechar caixa.'
-        });
+        res.status(500).json({ error: 'Erro ao fechar caixa.' });
     }
 });
 
-// ==========================================
-// RESUMO DO CAIXA
-// ==========================================
 app.get('/api/caixa/resumo', verifyAdminToken, async (req, res) => {
     try {
-        const caixaAberto = await pool.query(`
-            SELECT *
-            FROM caixas
-            WHERE status = 'aberto'
-            ORDER BY id DESC
-            LIMIT 1
-        `);
-
-        if (caixaAberto.rows.length === 0) {
-            return res.json({
-                aberto: false
-            });
-        }
+        const caixaAberto = await pool.query("SELECT * FROM caixas WHERE status = 'aberto' ORDER BY id DESC LIMIT 1");
+        if (caixaAberto.rows.length === 0) return res.json({ aberto: false });
 
         const caixa = caixaAberto.rows[0];
 
+        // LÓGICA ATUALIZADA: Agora busca na nova tabela 'comanda_pagamentos' 
+        // para obter o valor somado de forma exata e dividida
         const vendas = await pool.query(
-            `
-                SELECT
-                    forma_pagamento,
-                    SUM(valor) AS total
-                FROM comanda_pagamentos
-                WHERE caixa_id = $1
-                GROUP BY forma_pagamento
-            `,
+            "SELECT forma_pagamento, SUM(valor) as total FROM comanda_pagamentos WHERE caixa_id = $1 GROUP BY forma_pagamento",
             [caixa.id]
         );
 
-        return res.json({
+        res.json({
             aberto: true,
-            caixa,
+            caixa: caixa,
             vendas: vendas.rows
         });
     } catch (error) {
         console.error('Erro no resumo do caixa:', error);
-
-        return res.status(500).json({
-            error: 'Erro ao obter resumo do caixa.'
-        });
+        res.status(500).json({ error: 'Erro ao obter resumo do caixa.' });
     }
 });
 
+
 // ==========================================
-// ATENDER CHAMADA DE GARÇOM
+// ROTAS ADMINISTRATIVAS
 // ==========================================
+
 app.post('/api/garcom/atender', verifyAdminToken, async (req, res) => {
     try {
-        await pool.query(
-            `
-                UPDATE mesas
-                SET chamando_garcom = FALSE
-                WHERE id = $1
-            `,
-            [req.body.mesa_id]
-        );
-
+        await pool.query('UPDATE mesas SET chamando_garcom = FALSE WHERE id = $1', [req.body.mesa_id]);
         atualizarPainel();
-
-        return res.json({
-            success: true
-        });
+        res.json({ success: true });
     } catch (error) {
-        return res.status(500).json({
-            error: 'Erro ao atender garçom'
-        });
+        res.status(500).json({ error: 'Erro ao atender garçom' });
     }
 });
 
-// ==========================================
-// LISTAR MESAS E COMANDAS
-// ==========================================
 app.get('/api/mesas', verifyAdminToken, async (req, res) => {
     try {
+        await verificarImpressaoDB();
         const query = `
-            SELECT
-                m.id AS mesa_id,
-                m.numero,
-                m.status,
-                m.chamando_garcom,
-                c.id AS comanda_id,
-                c.codigo AS comanda_codigo,
-                c.data_abertura,
-                COALESCE(
-                    (
-                        SELECT json_agg(
-                            json_build_object(
-                                'id', ci.id,
-                                'nome_item', ci.nome_item,
-                                'preco_unitario', ci.preco_unitario,
-                                'quantidade', ci.quantidade,
-                                'observacoes', ci.observacoes
-                            )
-                        )
-                        FROM comanda_itens ci
-                        WHERE ci.comanda_id = c.id
-                    ),
-                    '[]'::json
-                ) AS items
-            FROM mesas m
-            LEFT JOIN comandas c
-                ON m.id = c.mesa_id
-                AND (
-                    LOWER(c.status) = 'aberta'
-                    OR c.status IS NULL
-                )
+            SELECT m.id as mesa_id, m.numero, m.status, m.chamando_garcom, c.id as comanda_id, c.codigo as comanda_codigo, c.data_abertura,
+                COALESCE((SELECT json_agg(json_build_object('id', ci.id, 'nome_item', ci.nome_item, 'preco_unitario', ci.preco_unitario, 'quantidade', ci.quantidade, 'observacoes', ci.observacoes, 'pedido_lote', ci.pedido_lote, 'quantidade_impressa', ci.quantidade_impressa)) FROM comanda_itens ci WHERE ci.comanda_id = c.id), '[]'::json) as items
+            FROM mesas m LEFT JOIN comandas c ON m.id = c.mesa_id AND (LOWER(c.status) = 'aberta' OR c.status IS NULL)
             ORDER BY m.numero ASC;
         `;
-
         const mesasRes = await pool.query(query);
-
-        return res.json(mesasRes.rows);
+        res.json(mesasRes.rows);
     } catch (error) {
-        return res.status(500).json({
-            error: 'Erro ao buscar mesas'
-        });
+        res.status(500).json({ error: 'Erro ao buscar mesas' });
     }
 });
 
+
 // ==========================================
-// CHECKOUT COM PAGAMENTOS MÚLTIPLOS
+// LÓGICA DE CHECKOUT ATUALIZADA - GESTÃO DE PAGAMENTOS MÚLTIPLOS E PARCIAIS
 // ==========================================
 app.post('/api/checkout', verifyAdminToken, async (req, res) => {
-    const {
-        comanda_id,
-        mesa_id,
-        pagamentos,
-        subtotal,
-        taxa,
-        desconto
-    } = req.body;
-
+    let { comanda_id, mesa_id, pagamentos, subtotal, taxa, desconto, final } = req.body;
     let client;
-
+    
     try {
         client = await pool.connect();
         await client.query('BEGIN');
-
-        // Usa a mesma ordem de bloqueio das rotas de edição.
         if (mesa_id) {
-            await client.query(
-                'SELECT id FROM mesas WHERE id = $1 FOR UPDATE',
-                [mesa_id]
-            );
+            await client.query('SELECT id FROM mesas WHERE id = $1 FOR UPDATE', [mesa_id]);
         } else if (comanda_id) {
-            const referenciaMesa = await client.query(
-                'SELECT mesa_id FROM comandas WHERE id = $1',
-                [comanda_id]
-            );
-
+            const referenciaMesa = await client.query('SELECT mesa_id FROM comandas WHERE id = $1', [comanda_id]);
             if (referenciaMesa.rows[0]?.mesa_id) {
-                await client.query(
-                    'SELECT id FROM mesas WHERE id = $1 FOR UPDATE',
-                    [referenciaMesa.rows[0].mesa_id]
-                );
+                await client.query('SELECT id FROM mesas WHERE id = $1 FOR UPDATE', [referenciaMesa.rows[0].mesa_id]);
             }
         }
-
+        
         let comandaTargetId = comanda_id;
-
         if (mesa_id && !comanda_id) {
-            const comandasAbertas = await client.query(
-                `
-                    SELECT id
-                    FROM comandas
-                    WHERE mesa_id = $1
-                    AND (
-                        LOWER(status) = 'aberta'
-                        OR status IS NULL
-                    )
-                `,
-                [mesa_id]
-            );
-
-            if (comandasAbertas.rows.length > 0) {
-                comandaTargetId = comandasAbertas.rows[0].id;
-            }
+            const comandasAbertas = await client.query('SELECT id FROM comandas WHERE mesa_id = $1 AND (LOWER(status) = \'aberta\' OR status IS NULL)', [mesa_id]);
+            if (comandasAbertas.rows.length > 0) comandaTargetId = comandasAbertas.rows[0].id;
         }
 
         if (comandaTargetId) {
+            // PROCURA QUAL O CAIXA ABERTO AGORA
             let caixaId = null;
-
-            const caixaAberto = await client.query(`
-                SELECT id
-                FROM caixas
-                WHERE status = 'aberto'
-                ORDER BY id DESC
-                LIMIT 1
-            `);
-
+            const caixaAberto = await client.query("SELECT id FROM caixas WHERE status = 'aberto' ORDER BY id DESC LIMIT 1");
             if (caixaAberto.rows.length > 0) {
                 caixaId = caixaAberto.rows[0].id;
             }
 
-            const itensSum = await client.query(
-                `
-                    SELECT
-                        SUM(quantidade * preco_unitario) AS soma
-                    FROM comanda_itens
-                    WHERE comanda_id = $1
-                `,
-                [comandaTargetId]
-            );
+            const itensSum = await client.query('SELECT SUM(quantidade * preco_unitario) as soma FROM comanda_itens WHERE comanda_id = $1', [comandaTargetId]);
+            let comSubtotal = itensSum.rows[0]?.soma || subtotal || 0;
+            let comFinal = comSubtotal - (desconto || 0) + (taxa || 0);
 
-            const comSubtotal =
-                itensSum.rows[0]?.soma || subtotal || 0;
+            // A forma_pagamento principal na comanda passa a ser a primeira (se for só uma) ou 'MULTIPLOS'
+            let formaPagamentoPrincipal = req.body.forma_pagamento || 'MULTIPLOS';
 
-            const comFinal =
-                comSubtotal - (desconto || 0) + (taxa || 0);
-
-            const formaPagamentoPrincipal =
-                req.body.forma_pagamento || 'MULTIPLOS';
-
+            // ATUALIZA A COMANDA COM O ID DO CAIXA
             await client.query(
-                `
-                    UPDATE comandas
-                    SET
-                        status = 'fechada',
-                        data_fechamento = NOW(),
-                        forma_pagamento = $1,
-                        subtotal = $2,
-                        taxa_servico = $3,
-                        desconto = $4,
-                        valor_total_final = $5,
-                        caixa_id = $6
-                    WHERE id = $7
-                `,
-                [
-                    formaPagamentoPrincipal,
-                    comSubtotal,
-                    taxa || 0,
-                    desconto || 0,
-                    comFinal,
-                    caixaId,
-                    comandaTargetId
-                ]
+                `UPDATE comandas SET status = 'fechada', data_fechamento = NOW(), forma_pagamento = $1, subtotal = $2, taxa_servico = $3, desconto = $4, valor_total_final = $5, caixa_id = $6 WHERE id = $7`,
+                [formaPagamentoPrincipal, comSubtotal, taxa || 0, desconto || 0, comFinal, caixaId, comandaTargetId]
             );
 
+            // REGISTAR OS PAGAMENTOS DETALHADOS NO CAIXA DAQUELA PESSOA/PESSOAS
             if (pagamentos && pagamentos.length > 0) {
-                for (const pagamento of pagamentos) {
+                for (const p of pagamentos) {
                     await client.query(
-                        `
-                            INSERT INTO comanda_pagamentos (
-                                comanda_id,
-                                caixa_id,
-                                forma_pagamento,
-                                valor
-                            )
-                            VALUES ($1, $2, $3, $4)
-                        `,
-                        [
-                            comandaTargetId,
-                            caixaId,
-                            pagamento.metodo,
-                            pagamento.valor
-                        ]
+                        `INSERT INTO comanda_pagamentos (comanda_id, caixa_id, forma_pagamento, valor) VALUES ($1, $2, $3, $4)`,
+                        [comandaTargetId, caixaId, p.metodo, p.valor]
                     );
                 }
             } else {
+                // Fallback de segurança se falhar o envio do array a partir do front-end
                 await client.query(
-                    `
-                        INSERT INTO comanda_pagamentos (
-                            comanda_id,
-                            caixa_id,
-                            forma_pagamento,
-                            valor
-                        )
-                        VALUES ($1, $2, $3, $4)
-                    `,
-                    [
-                        comandaTargetId,
-                        caixaId,
-                        formaPagamentoPrincipal,
-                        comFinal
-                    ]
+                    `INSERT INTO comanda_pagamentos (comanda_id, caixa_id, forma_pagamento, valor) VALUES ($1, $2, $3, $4)`,
+                    [comandaTargetId, caixaId, formaPagamentoPrincipal, comFinal]
                 );
             }
         }
 
         if (mesa_id) {
-            await client.query(
-                `
-                    UPDATE mesas
-                    SET
-                        status = $1,
-                        chamando_garcom = FALSE,
-                        token_sessao = NULL
-                    WHERE id = $2
-                `,
-                ['livre', mesa_id]
-            );
+            await client.query('UPDATE mesas SET status = $1, chamando_garcom = FALSE, token_sessao = NULL WHERE id = $2', ['livre', mesa_id]);
         }
-
+        
         await client.query('COMMIT');
-
         atualizarPainel();
-
-        return res.json({
-            success: true
-        });
+        res.json({ success: true });
+        
     } catch (error) {
         if (client) await client.query('ROLLBACK');
-
         console.error('Erro no checkout:', error);
-
-        return res.status(500).json({
-            error: 'Erro ao fechar comanda'
-        });
+        res.status(500).json({ error: 'Erro ao fechar comanda' });
     } finally {
         if (client) client.release();
     }
 });
 
-// ==========================================
-// CANCELAR MESA/COMANDA
-// ==========================================
 app.post('/api/admin/mesa/cancelar', verifyAdminToken, async (req, res) => {
     let { mesa_id, comanda_id } = req.body;
     let client;
-
+    
     try {
         client = await pool.connect();
         await client.query('BEGIN');
-
         if (mesa_id) {
-            await client.query(
-                'SELECT id FROM mesas WHERE id = $1 FOR UPDATE',
-                [mesa_id]
-            );
+            await client.query('SELECT id FROM mesas WHERE id = $1 FOR UPDATE', [mesa_id]);
         } else if (comanda_id) {
-            const referenciaMesa = await client.query(
-                'SELECT mesa_id FROM comandas WHERE id = $1',
-                [comanda_id]
-            );
-
+            const referenciaMesa = await client.query('SELECT mesa_id FROM comandas WHERE id = $1', [comanda_id]);
             if (referenciaMesa.rows[0]?.mesa_id) {
-                await client.query(
-                    'SELECT id FROM mesas WHERE id = $1 FOR UPDATE',
-                    [referenciaMesa.rows[0].mesa_id]
-                );
+                await client.query('SELECT id FROM mesas WHERE id = $1 FOR UPDATE', [referenciaMesa.rows[0].mesa_id]);
             }
         }
-
+        
         if (!comanda_id && mesa_id) {
-            const comRes = await client.query(
-                `
-                    SELECT id
-                    FROM comandas
-                    WHERE mesa_id = $1
-                    AND LOWER(status) = 'aberta'
-                `,
-                [mesa_id]
-            );
-
-            if (comRes.rows.length > 0) {
-                comanda_id = comRes.rows[0].id;
-            }
+            const comRes = await client.query('SELECT id FROM comandas WHERE mesa_id = $1 AND LOWER(status) = \'aberta\'', [mesa_id]);
+            if (comRes.rows.length > 0) comanda_id = comRes.rows[0].id;
         }
 
         if (comanda_id) {
-            await client.query(
-                `
-                    DELETE FROM comanda_pagamentos
-                    WHERE comanda_id = $1
-                `,
-                [comanda_id]
-            );
-
-            await client.query(
-                `
-                    DELETE FROM comanda_itens
-                    WHERE comanda_id = $1
-                `,
-                [comanda_id]
-            );
-
-            await client.query(
-                'DELETE FROM comandas WHERE id = $1',
-                [comanda_id]
-            );
+            await client.query('DELETE FROM comanda_pagamentos WHERE comanda_id = $1', [comanda_id]); // Segurança de limpeza
+            await client.query('DELETE FROM comanda_itens WHERE comanda_id = $1', [comanda_id]);
+            await client.query('DELETE FROM comandas WHERE id = $1', [comanda_id]);
         }
-
+        
         if (mesa_id) {
-            await client.query(
-                `
-                    UPDATE mesas
-                    SET
-                        status = $1,
-                        chamando_garcom = FALSE,
-                        token_sessao = NULL
-                    WHERE id = $2
-                `,
-                ['livre', mesa_id]
-            );
+            await client.query('UPDATE mesas SET status = $1, chamando_garcom = FALSE, token_sessao = NULL WHERE id = $2', ['livre', mesa_id]);
         }
 
         await client.query('COMMIT');
-
         atualizarPainel();
-
-        return res.json({
-            success: true,
-            message: 'Mesa cancelada.'
-        });
+        res.json({ success: true, message: 'Mesa cancelada.' });
+        
     } catch (error) {
         if (client) await client.query('ROLLBACK');
-
-        return res.status(500).json({
-            error: 'Erro ao cancelar'
-        });
+        res.status(500).json({ error: 'Erro ao cancelar' });
     } finally {
         if (client) client.release();
     }
 });
 
-// ==========================================
-// APOIO À EDIÇÃO DE COMANDAS
-// ==========================================
+// Edição de comandas pelo operador do painel.
 function erroEdicaoMesa(status, mensagem) {
-    return Object.assign(
-        new Error(mensagem),
-        { status }
-    );
+    return Object.assign(new Error(mensagem), { status });
 }
 
 function inteiroPositivo(valor) {
     return Number.isSafeInteger(valor) && valor > 0;
 }
 
-// ==========================================
-// LANÇAR PEDIDO MANUAL NA MESA
-// ==========================================
-app.post(
-    '/api/admin/mesa/adicionar-itens',
-    verifyAdminToken,
-    async (req, res) => {
-        const {
-            mesa_id,
-            cart,
-            comanda_id
-        } = req.body || {};
-
-        if (
-            !inteiroPositivo(mesa_id) ||
-            !Array.isArray(cart) ||
-            !cart.length ||
-            cart.some(item =>
-                !item ||
-                typeof item.name !== 'string' ||
-                !item.name.trim() ||
-                !inteiroPositivo(item.quantity) ||
-                typeof item.unitPrice !== 'number' ||
-                !Number.isFinite(item.unitPrice) ||
-                item.unitPrice < 0 ||
-                item.unitPrice > 99999999.99 ||
-                (
-                    item.notes !== undefined &&
-                    typeof item.notes !== 'string'
-                )
-            )
-        ) {
-            return res.status(400).json({
-                error: 'Mesa ou itens inválidos.'
-            });
-        }
-
-        if (
-            Object.hasOwn(req.body, 'comanda_id') &&
-            comanda_id !== null &&
-            !inteiroPositivo(comanda_id)
-        ) {
-            return res.status(400).json({
-                error: 'Comanda inválida.'
-            });
-        }
-
-        let client;
-
-        try {
-            client = await pool.connect();
-            await client.query('BEGIN');
-
-            const mesa = await client.query(
-                `
-                    SELECT id
-                    FROM mesas
-                    WHERE id = $1
-                    FOR UPDATE
-                `,
-                [mesa_id]
-            );
-
-            if (!mesa.rows.length) {
-                throw erroEdicaoMesa(
-                    404,
-                    'Mesa não encontrada.'
-                );
-            }
-
-            const aberta = await client.query(
-                `
-                    SELECT id
-                    FROM comandas
-                    WHERE mesa_id = $1
-                    AND (
-                        LOWER(status) = 'aberta'
-                        OR status IS NULL
-                    )
-                    AND data_fechamento IS NULL
-                    ORDER BY id DESC
-                    FOR UPDATE
-                `,
-                [mesa_id]
-            );
-
-            if (aberta.rows.length > 1) {
-                throw erroEdicaoMesa(
-                    409,
-                    'Há mais de uma comanda aberta nesta mesa.'
-                );
-            }
-
-            let comandaId = aberta.rows[0]?.id || null;
-
-            if (
-                Object.hasOwn(req.body, 'comanda_id') &&
-                comanda_id !== comandaId
-            ) {
-                throw erroEdicaoMesa(
-                    409,
-                    'A comanda desta mesa mudou. Atualize a mesa e confira o pedido antes de reenviar.'
-                );
-            }
-
-            // Se a mesa estiver vazia, cria a comanda.
-            if (!comandaId) {
-                const nova = await client.query(
-                    `
-                        INSERT INTO comandas (
-                            codigo,
-                            mesa_id,
-                            status
-                        )
-                        VALUES ($1, $2, 'aberta')
-                        RETURNING id
-                    `,
-                    [
-                        `#${Math.floor(100 + Math.random() * 900)}`,
-                        mesa_id
-                    ]
-                );
-
-                comandaId = nova.rows[0].id;
-            }
-
-            for (const item of cart) {
-                await client.query(
-                    `
-                        INSERT INTO comanda_itens (
-                            comanda_id,
-                            item_id_cache,
-                            nome_item,
-                            quantidade,
-                            preco_unitario,
-                            observacoes
-                        )
-                        VALUES ($1, $2, $3, $4, $5, $6)
-                    `,
-                    [
-                        comandaId,
-                        String(item.dishId || 'item'),
-                        item.name.trim(),
-                        item.quantity,
-                        Math.round(item.unitPrice * 100) / 100,
-                        item.notes || ''
-                    ]
-                );
-            }
-
-            await client.query(
-                `
-                    UPDATE mesas
-                    SET status = 'ocupada'
-                    WHERE id = $1
-                `,
-                [mesa_id]
-            );
-
-            await client.query('COMMIT');
-
-            atualizarPainel();
-
-            return res.json({
-                success: true,
-                comanda_id: comandaId
-            });
-        } catch (error) {
-            if (client) await client.query('ROLLBACK');
-
-            console.error(
-                'Erro ao adicionar itens pelo painel:',
-                error
-            );
-
-            return res.status(error.status || 500).json({
-                error: error.status
-                    ? error.message
-                    : 'Erro ao adicionar itens.'
-            });
-        } finally {
-            if (client) client.release();
-        }
+app.post('/api/admin/mesa/adicionar-itens', verifyAdminToken, async (req, res) => {
+    const { mesa_id, cart, comanda_id } = req.body || {};
+    if (!inteiroPositivo(mesa_id) || !Array.isArray(cart) || !cart.length ||
+        cart.some(i => !i || typeof i.name !== 'string' || !i.name.trim() ||
+            !inteiroPositivo(i.quantity) || typeof i.unitPrice !== 'number' ||
+            !Number.isFinite(i.unitPrice) || i.unitPrice < 0 || i.unitPrice > 99999999.99 ||
+            (i.notes !== undefined && typeof i.notes !== 'string'))) {
+        return res.status(400).json({ error: 'Mesa ou itens inválidos.' });
     }
-);
+    if (Object.hasOwn(req.body, 'comanda_id') && comanda_id !== null && !inteiroPositivo(comanda_id)) {
+        return res.status(400).json({ error: 'Comanda inválida.' });
+    }
+    let client;
+    try {
+        await verificarImpressaoDB();
+        client = await pool.connect();
+        await client.query('BEGIN');
+        const mesa = await client.query('SELECT id FROM mesas WHERE id = $1 FOR UPDATE', [mesa_id]);
+        if (!mesa.rows.length) throw erroEdicaoMesa(404, 'Mesa não encontrada.');
+        const aberta = await client.query(`
+            SELECT id FROM comandas WHERE mesa_id = $1
+            AND (LOWER(status) = 'aberta' OR status IS NULL)
+            AND data_fechamento IS NULL ORDER BY id DESC FOR UPDATE
+        `, [mesa_id]);
+        if (aberta.rows.length > 1) throw erroEdicaoMesa(409, 'Há mais de uma comanda aberta nesta mesa.');
+        let comandaId = aberta.rows[0]?.id || null;
+        if (Object.hasOwn(req.body, 'comanda_id') && comanda_id !== comandaId) {
+            throw erroEdicaoMesa(409, 'A comanda desta mesa mudou. Atualize a mesa e confira o pedido antes de reenviar.');
+        }
+        if (!comandaId) {
+            const nova = await client.query(`
+                INSERT INTO comandas (codigo, mesa_id, status)
+                VALUES ($1, $2, 'aberta') RETURNING id
+            `, [`#${Math.floor(100 + Math.random() * 900)}`, mesa_id]);
+            comandaId = nova.rows[0].id;
+        }
+        const pedidoLote = crypto.randomUUID();
+        for (const i of cart) {
+            await client.query(`
+                INSERT INTO comanda_itens
+                (comanda_id, item_id_cache, nome_item, quantidade, preco_unitario, observacoes, pedido_lote)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+            `, [comandaId, String(i.dishId || 'item'), i.name.trim(), i.quantity,
+                Math.round(i.unitPrice * 100) / 100, i.notes || '', pedidoLote]);
+        }
+        await client.query("UPDATE mesas SET status = 'ocupada' WHERE id = $1", [mesa_id]);
+        await client.query('COMMIT');
+        atualizarPainel();
+        res.json({ success: true, comanda_id: comandaId });
+    } catch (error) {
+        if (client) await client.query('ROLLBACK');
+        console.error('Erro ao adicionar itens pelo painel:', error);
+        res.status(error.status || 500).json({ error: error.status ? error.message : 'Erro ao adicionar itens.' });
+    } finally {
+        if (client) client.release();
+    }
+});
 
-// ==========================================
-// ALTERAR QUANTIDADE OU REMOVER ITEM
-// ==========================================
 async function editarItemDaMesa(req, res, remover) {
     const id = Number(req.params.id);
     const dados = req.body || {};
-
-    if (
-        !inteiroPositivo(id) ||
-        (!remover && !inteiroPositivo(dados.quantidade))
-    ) {
-        return res.status(400).json({
-            error: 'Item ou quantidade inválida.'
-        });
+    if (!inteiroPositivo(id) || (!remover && !inteiroPositivo(dados.quantidade))) {
+        return res.status(400).json({ error: 'Item ou quantidade inválida.' });
     }
-
     let client;
-
     try {
+        await verificarImpressaoDB();
         client = await pool.connect();
         await client.query('BEGIN');
-
-        const referencia = await client.query(
-            `
-                SELECT
-                    ci.comanda_id,
-                    c.mesa_id
-                FROM comanda_itens ci
-                JOIN comandas c
-                    ON c.id = ci.comanda_id
-                WHERE ci.id = $1
-            `,
-            [id]
-        );
-
-        if (!referencia.rows.length) {
-            throw erroEdicaoMesa(
-                404,
-                'Item não encontrado. Atualize a mesa.'
-            );
+        const referencia = await client.query(`
+            SELECT ci.comanda_id, c.mesa_id
+            FROM comanda_itens ci JOIN comandas c ON c.id = ci.comanda_id
+            WHERE ci.id = $1
+        `, [id]);
+        if (!referencia.rows.length) throw erroEdicaoMesa(404, 'Item não encontrado. Atualize a mesa.');
+        const { comanda_id, mesa_id } = referencia.rows[0];
+        if ((dados.mesa_id !== undefined && dados.mesa_id !== mesa_id) ||
+            (dados.comanda_id !== undefined && dados.comanda_id !== comanda_id)) {
+            throw erroEdicaoMesa(409, 'O item não pertence à comanda selecionada.');
         }
-
-        const {
-            comanda_id,
-            mesa_id
-        } = referencia.rows[0];
-
-        if (
-            (
-                dados.mesa_id !== undefined &&
-                dados.mesa_id !== mesa_id
-            ) ||
-            (
-                dados.comanda_id !== undefined &&
-                dados.comanda_id !== comanda_id
-            )
-        ) {
-            throw erroEdicaoMesa(
-                409,
-                'O item não pertence à comanda selecionada.'
-            );
+        await client.query('SELECT id FROM mesas WHERE id = $1 FOR UPDATE', [mesa_id]);
+        const comanda = await client.query(`
+            SELECT id FROM comandas WHERE id = $1
+            AND (LOWER(status) = 'aberta' OR status IS NULL)
+            AND data_fechamento IS NULL FOR UPDATE
+        `, [comanda_id]);
+        if (!comanda.rows.length) throw erroEdicaoMesa(409, 'Esta comanda já foi fechada ou cancelada.');
+        const item = await client.query('SELECT quantidade FROM comanda_itens WHERE id = $1 FOR UPDATE', [id]);
+        if (!item.rows.length) throw erroEdicaoMesa(404, 'Item já removido. Atualize a mesa.');
+        if (dados.quantidade_anterior !== undefined && dados.quantidade_anterior !== item.rows[0].quantidade) {
+            throw erroEdicaoMesa(409, 'A quantidade já foi alterada. Confira a mesa antes de tentar novamente.');
         }
-
-        await client.query(
-            `
-                SELECT id
-                FROM mesas
-                WHERE id = $1
-                FOR UPDATE
-            `,
-            [mesa_id]
-        );
-
-        const comanda = await client.query(
-            `
-                SELECT id
-                FROM comandas
-                WHERE id = $1
-                AND (
-                    LOWER(status) = 'aberta'
-                    OR status IS NULL
-                )
-                AND data_fechamento IS NULL
-                FOR UPDATE
-            `,
-            [comanda_id]
-        );
-
-        if (!comanda.rows.length) {
-            throw erroEdicaoMesa(
-                409,
-                'Esta comanda já foi fechada ou cancelada.'
-            );
-        }
-
-        const item = await client.query(
-            `
-                SELECT quantidade
-                FROM comanda_itens
-                WHERE id = $1
-                FOR UPDATE
-            `,
-            [id]
-        );
-
-        if (!item.rows.length) {
-            throw erroEdicaoMesa(
-                404,
-                'Item já removido. Atualize a mesa.'
-            );
-        }
-
-        if (
-            dados.quantidade_anterior !== undefined &&
-            dados.quantidade_anterior !== item.rows[0].quantidade
-        ) {
-            throw erroEdicaoMesa(
-                409,
-                'A quantidade já foi alterada. Confira a mesa antes de tentar novamente.'
-            );
-        }
-
         if (remover) {
-            await client.query(
-                'DELETE FROM comanda_itens WHERE id = $1',
-                [id]
-            );
+            await client.query('DELETE FROM comanda_itens WHERE id = $1', [id]);
         } else {
-            await client.query(
-                `
-                    UPDATE comanda_itens
-                    SET quantidade = $1
-                    WHERE id = $2
-                `,
-                [dados.quantidade, id]
-            );
+            await client.query('UPDATE comanda_itens SET quantidade = $1, quantidade_impressa = LEAST(quantidade_impressa, $1) WHERE id = $2', [dados.quantidade, id]);
         }
-
-        // Ao remover o último item, mantém a comanda aberta
-        // até o operador cancelá-la ou lançar novos itens.
+        // Ao remover o último item, mantém a comanda aberta até o operador cancelá-la.
         await client.query('COMMIT');
-
         atualizarPainel();
-
-        return res.json({
-            success: true
-        });
+        res.json({ success: true });
     } catch (error) {
         if (client) await client.query('ROLLBACK');
-
-        console.error(
-            'Erro ao editar item da mesa:',
-            error
-        );
-
-        return res.status(error.status || 500).json({
-            error: error.status
-                ? error.message
-                : 'Erro ao editar item.'
-        });
+        console.error('Erro ao editar item da mesa:', error);
+        res.status(error.status || 500).json({ error: error.status ? error.message : 'Erro ao editar item.' });
     } finally {
         if (client) client.release();
     }
 }
 
-app.put(
-    '/api/admin/comanda-item/:id',
-    verifyAdminToken,
-    (req, res) => editarItemDaMesa(req, res, false)
-);
+app.put('/api/admin/comanda-item/:id', verifyAdminToken, (req, res) => editarItemDaMesa(req, res, false));
+app.delete('/api/admin/comanda-item/:id', verifyAdminToken, (req, res) => editarItemDaMesa(req, res, true));
 
-app.delete(
-    '/api/admin/comanda-item/:id',
-    verifyAdminToken,
-    (req, res) => editarItemDaMesa(req, res, true)
-);
-
-// ==========================================
-// HISTÓRICO
-// ==========================================
 app.get('/api/historico', verifyAdminToken, async (req, res) => {
     const { filtro } = req.query;
-
     try {
         let query = `
-            SELECT
-                c.id,
-                c.codigo,
-                c.status,
-                c.data_abertura,
-                c.data_fechamento,
-                c.forma_pagamento,
-                c.valor_total_final,
-                COALESCE(m.numero, '0') AS mesa_numero,
-                COALESCE(
-                    (
-                        SELECT json_agg(
-                            json_build_object(
-                                'nome_item', ci.nome_item,
-                                'quantidade', ci.quantidade,
-                                'preco_unitario', ci.preco_unitario,
-                                'observacoes', ci.observacoes
-                            )
-                        )
-                        FROM comanda_itens ci
-                        WHERE ci.comanda_id = c.id
-                    ),
-                    '[]'::json
-                ) AS items
-            FROM comandas c
-            LEFT JOIN mesas m
-                ON c.mesa_id = m.id
-            WHERE (
-                LOWER(c.status) = 'fechada'
-                OR c.data_fechamento IS NOT NULL
-            )
+            SELECT c.id, c.codigo, c.status, c.data_abertura, c.data_fechamento, c.forma_pagamento, c.valor_total_final, COALESCE(m.numero, '0') as mesa_numero,
+                   COALESCE((SELECT json_agg(json_build_object('nome_item', ci.nome_item, 'quantidade', ci.quantidade, 'preco_unitario', ci.preco_unitario, 'observacoes', ci.observacoes)) FROM comanda_itens ci WHERE ci.comanda_id = c.id), '[]'::json) as items
+            FROM comandas c LEFT JOIN mesas m ON c.mesa_id = m.id WHERE (LOWER(c.status) = 'fechada' OR c.data_fechamento IS NOT NULL)
         `;
-
-        if (filtro === 'dia') {
-            query += `
-                AND c.data_fechamento >= NOW() - INTERVAL '1 day'
-            `;
-        } else if (filtro === 'semana') {
-            query += `
-                AND c.data_fechamento >= NOW() - INTERVAL '7 days'
-            `;
-        } else if (filtro === 'mes') {
-            query += `
-                AND c.data_fechamento >= NOW() - INTERVAL '30 days'
-            `;
-        }
-
-        query += `
-            ORDER BY c.data_fechamento DESC
-            LIMIT 150
-        `;
+        
+        if (filtro === 'dia') query += ` AND c.data_fechamento >= NOW() - INTERVAL '1 day'`;
+        else if (filtro === 'semana') query += ` AND c.data_fechamento >= NOW() - INTERVAL '7 days'`;
+        else if (filtro === 'mes') query += ` AND c.data_fechamento >= NOW() - INTERVAL '30 days'`;
+        
+        query += ` ORDER BY c.data_fechamento DESC LIMIT 150`;
 
         const result = await pool.query(query);
-
-        return res.json(result.rows);
+        res.json(result.rows);
     } catch (error) {
-        return res.status(500).json({
-            error: 'Erro no histórico'
-        });
+        res.status(500).json({ error: 'Erro no histórico' });
     }
 });
 
+
 // ==========================================
-// ESTATÍSTICAS
+// ESTATÍSTICAS COM CÁLCULO DE MÉDIAS REAIS
 // ==========================================
 app.get('/api/estatisticas', verifyAdminToken, async (req, res) => {
     try {
-        const fatDia = pool.query(`
-            SELECT SUM(valor_total_final) AS total
-            FROM comandas
-            WHERE (
-                LOWER(status) = 'fechada'
-                OR data_fechamento IS NOT NULL
-            )
-            AND data_fechamento >= NOW() - INTERVAL '1 day'
-        `);
-
-        const fatSemana = pool.query(`
-            SELECT SUM(valor_total_final) AS total
-            FROM comandas
-            WHERE (
-                LOWER(status) = 'fechada'
-                OR data_fechamento IS NOT NULL
-            )
-            AND data_fechamento >= NOW() - INTERVAL '7 days'
-        `);
-
-        const fatMes = pool.query(`
-            SELECT SUM(valor_total_final) AS total
-            FROM comandas
-            WHERE (
-                LOWER(status) = 'fechada'
-                OR data_fechamento IS NOT NULL
-            )
-            AND data_fechamento >= NOW() - INTERVAL '30 days'
-        `);
-
+        // Faturamento Bruto Acumulado (Hoje, 7 dias, 30 dias)
+        const fatDia = pool.query(`SELECT SUM(valor_total_final) as total FROM comandas WHERE (LOWER(status) = 'fechada' OR data_fechamento IS NOT NULL) AND data_fechamento >= NOW() - INTERVAL '1 day'`);
+        const fatSemana = pool.query(`SELECT SUM(valor_total_final) as total FROM comandas WHERE (LOWER(status) = 'fechada' OR data_fechamento IS NOT NULL) AND data_fechamento >= NOW() - INTERVAL '7 days'`);
+        const fatMes = pool.query(`SELECT SUM(valor_total_final) as total FROM comandas WHERE (LOWER(status) = 'fechada' OR data_fechamento IS NOT NULL) AND data_fechamento >= NOW() - INTERVAL '30 days'`);
+        
+        // NOVO: Cálculo de Médias Históricas Reais (Baseado nos dias/semanas de funcionamento)
         const mediasQry = pool.query(`
-            SELECT
-                COALESCE(
-                    SUM(valor_total_final) /
-                    NULLIF(
-                        COUNT(
-                            DISTINCT DATE_TRUNC(
-                                'day',
-                                data_fechamento
-                            )
-                        ),
-                        0
-                    ),
-                    0
-                ) AS media_dia,
-                COALESCE(
-                    SUM(valor_total_final) /
-                    NULLIF(
-                        COUNT(
-                            DISTINCT DATE_TRUNC(
-                                'week',
-                                data_fechamento
-                            )
-                        ),
-                        0
-                    ),
-                    0
-                ) AS media_semana,
-                COALESCE(
-                    SUM(valor_total_final) /
-                    NULLIF(
-                        COUNT(
-                            DISTINCT DATE_TRUNC(
-                                'month',
-                                data_fechamento
-                            )
-                        ),
-                        0
-                    ),
-                    0
-                ) AS media_mes
-            FROM comandas
-            WHERE (
-                LOWER(status) = 'fechada'
-                OR data_fechamento IS NOT NULL
-            )
+            SELECT 
+                COALESCE(SUM(valor_total_final) / NULLIF(COUNT(DISTINCT DATE_TRUNC('day', data_fechamento)), 0), 0) as media_dia,
+                COALESCE(SUM(valor_total_final) / NULLIF(COUNT(DISTINCT DATE_TRUNC('week', data_fechamento)), 0), 0) as media_semana,
+                COALESCE(SUM(valor_total_final) / NULLIF(COUNT(DISTINCT DATE_TRUNC('month', data_fechamento)), 0), 0) as media_mes
+            FROM comandas 
+            WHERE (LOWER(status) = 'fechada' OR data_fechamento IS NOT NULL)
         `);
 
+        // Itens mais vendidos
         const itensVendidos = pool.query(`
-            SELECT
-                ci.nome_item,
-                SUM(ci.quantidade) AS total_qtd
-            FROM comanda_itens ci
-            JOIN comandas c
-                ON ci.comanda_id = c.id
-            WHERE (
-                LOWER(c.status) = 'fechada'
-                OR c.data_fechamento IS NOT NULL
-            )
-            GROUP BY ci.nome_item
+            SELECT ci.nome_item, SUM(ci.quantidade) as total_qtd 
+            FROM comanda_itens ci 
+            JOIN comandas c ON ci.comanda_id = c.id 
+            WHERE (LOWER(c.status) = 'fechada' OR c.data_fechamento IS NOT NULL) 
+            GROUP BY ci.nome_item 
             ORDER BY total_qtd DESC
         `);
 
-        const [
-            rFatDia,
-            rFatSemana,
-            rFatMes,
-            rMedias,
-            rItens
-        ] = await Promise.all([
-            fatDia,
-            fatSemana,
-            fatMes,
-            mediasQry,
-            itensVendidos
-        ]);
+        const [rFatDia, rFatSemana, rFatMes, rMedias, rItens] = await Promise.all([fatDia, fatSemana, fatMes, mediasQry, itensVendidos]);
 
-        return res.json({
-            faturamento: {
-                dia: rFatDia.rows[0]?.total || 0,
-                semana: rFatSemana.rows[0]?.total || 0,
-                mes: rFatMes.rows[0]?.total || 0
+        res.json({
+            faturamento: { 
+                dia: rFatDia.rows[0]?.total || 0, 
+                semana: rFatSemana.rows[0]?.total || 0, 
+                mes: rFatMes.rows[0]?.total || 0 
             },
             medias: {
                 dia: rMedias.rows[0]?.media_dia || 0,
@@ -1612,18 +751,18 @@ app.get('/api/estatisticas', verifyAdminToken, async (req, res) => {
             },
             itens: rItens.rows || []
         });
+        
     } catch (error) {
-        console.error('Erro nas estatísticas:', error);
-
-        return res.status(500).json({
-            error: 'Erro nas estatísticas'
-        });
+        console.error("Erro nas estatísticas:", error);
+        res.status(500).json({ error: 'Erro nas estatísticas' });
     }
 });
 
+
 // ==========================================
-// DELIVERY: CRIAÇÃO DA TABELA
+// DELIVERY: persistência e atualização do painel
 // ==========================================
+// A inicialização começa uma vez. As rotas aguardam a tabela antes de consultar.
 const deliveryDBReady = pool.query(`
     CREATE TABLE IF NOT EXISTS pedidos_delivery (
         id SERIAL PRIMARY KEY,
@@ -1631,268 +770,102 @@ const deliveryDBReady = pool.query(`
         cliente_nome TEXT NOT NULL,
         endereco TEXT NOT NULL,
         itens JSONB NOT NULL,
-
-        valor_total NUMERIC(12,2) NOT NULL
-            CHECK (valor_total >= 0),
-
-        origem TEXT NOT NULL
-            DEFAULT 'WHATSAPP_DELIVERY',
-
+        valor_total NUMERIC(12,2) NOT NULL CHECK (valor_total >= 0),
+        origem TEXT NOT NULL DEFAULT 'WHATSAPP_DELIVERY',
         status TEXT NOT NULL DEFAULT 'novo'
-            CHECK (
-                status IN (
-                    'novo',
-                    'preparo',
-                    'caminho',
-                    'entregue'
-                )
-            ),
-
-        data_criacao TIMESTAMPTZ NOT NULL
-            DEFAULT NOW(),
-
-        data_atualizacao TIMESTAMPTZ NOT NULL
-            DEFAULT NOW()
+            CHECK (status IN ('novo', 'preparo', 'caminho', 'entregue')),
+        data_criacao TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        data_atualizacao TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
-`).then(() => {
-    return true;
-}).catch(error => {
-    console.error(
-        'Erro ao inicializar tabela de delivery:',
-        error
-    );
-
+`).then(() => true).catch(error => {
+    console.error('Erro ao inicializar tabela de delivery:', error);
     return false;
 });
 
 async function verificarDeliveryDB() {
-    if (!await deliveryDBReady) {
-        throw new Error(
-            'Tabela de delivery indisponível'
-        );
-    }
+    if (!await deliveryDBReady) throw new Error('Tabela de delivery indisponível');
 }
 
-// ==========================================
-// DELIVERY: RECEBER NOVO PEDIDO
-// ==========================================
 app.post('/api/delivery/novo', async (req, res) => {
     const { cliente, itens, origem } = req.body || {};
-
-    if (
-        !cliente ||
-        typeof cliente.nome !== 'string' ||
-        !cliente.nome.trim() ||
-        !Array.isArray(itens) ||
-        itens.length === 0 ||
-        itens.some(item =>
-            !item ||
-            !Number.isInteger(item.quantity) ||
-            item.quantity <= 0 ||
-            typeof item.unitPrice !== 'number' ||
-            !Number.isFinite(item.unitPrice) ||
-            item.unitPrice < 0
-        )
-    ) {
-        return res.status(400).json({
-            error: 'Informe o cliente e um carrinho válido.'
-        });
+    if (!cliente || typeof cliente.nome !== 'string' || !cliente.nome.trim() ||
+        !Array.isArray(itens) || itens.length === 0 ||
+        itens.some(item => !item || !Number.isInteger(item.quantity) || item.quantity <= 0 ||
+            typeof item.unitPrice !== 'number' || !Number.isFinite(item.unitPrice) || item.unitPrice < 0)) {
+        return res.status(400).json({ error: 'Informe o cliente e um carrinho válido.' });
     }
 
-    const totalCentavos = itens.reduce(
-        (total, item) =>
-            total +
-            Math.round(item.unitPrice * 100) * item.quantity,
-        0
-    );
-
-    if (
-        !Number.isSafeInteger(totalCentavos) ||
-        totalCentavos > 999999999999
-    ) {
-        return res.status(400).json({
-            error: 'Valor do pedido inválido.'
-        });
+    // Compatível com o carrinho enviado pelo cardápio de WhatsApp.
+    const totalCentavos = itens.reduce((total, item) =>
+        total + Math.round(item.unitPrice * 100) * item.quantity, 0);
+    if (!Number.isSafeInteger(totalCentavos) || totalCentavos > 999999999999) {
+        return res.status(400).json({ error: 'Valor do pedido inválido.' });
     }
-
     const endereco = [
-        [cliente.rua, cliente.numero]
-            .filter(Boolean)
-            .join(', '),
-        cliente.bairro,
-        cliente.complemento
+        [cliente.rua, cliente.numero].filter(Boolean).join(', '),
+        cliente.bairro, cliente.complemento
     ].filter(Boolean).join(' - ');
 
     try {
         await verificarDeliveryDB();
+        const resultado = await pool.query(`
+            INSERT INTO pedidos_delivery
+                (cliente, cliente_nome, endereco, itens, valor_total, origem, status)
+            VALUES ($1::jsonb, $2, $3, $4::jsonb, $5, $6, 'novo')
+            RETURNING id, status
+        `, [JSON.stringify(cliente), cliente.nome.trim(), endereco,
+            JSON.stringify(itens), totalCentavos / 100,
+            typeof origem === 'string' && origem.trim() ? origem.trim() : 'WHATSAPP_DELIVERY']);
 
-        const resultado = await pool.query(
-            `
-                INSERT INTO pedidos_delivery (
-                    cliente,
-                    cliente_nome,
-                    endereco,
-                    itens,
-                    valor_total,
-                    origem,
-                    status
-                )
-                VALUES (
-                    $1::jsonb,
-                    $2,
-                    $3,
-                    $4::jsonb,
-                    $5,
-                    $6,
-                    'novo'
-                )
-                RETURNING id, status
-            `,
-            [
-                JSON.stringify(cliente),
-                cliente.nome.trim(),
-                endereco,
-                JSON.stringify(itens),
-                totalCentavos / 100,
-                typeof origem === 'string' && origem.trim()
-                    ? origem.trim()
-                    : 'WHATSAPP_DELIVERY'
-            ]
-        );
-
+        // Só confirma e avisa o painel depois de gravar no banco.
         io.emit('atualizacao_delivery');
-
-        return res.status(201).json({
-            sucesso: true,
-            pedido: resultado.rows[0]
-        });
+        return res.status(201).json({ sucesso: true, pedido: resultado.rows[0] });
     } catch (error) {
         console.error('Erro ao salvar delivery:', error);
-
-        return res.status(500).json({
-            error: 'Não foi possível salvar o pedido.'
-        });
+        return res.status(500).json({ error: 'Não foi possível salvar o pedido.' });
     }
 });
 
-// ==========================================
-// DELIVERY: LISTAR PEDIDOS ATIVOS
-// ==========================================
-app.get(
-    '/api/delivery/listar',
-    verifyAdminToken,
-    async (req, res) => {
-        try {
-            await verificarDeliveryDB();
-
-            const resultado = await pool.query(`
-                SELECT
-                    id,
-                    cliente,
-                    cliente_nome,
-                    endereco,
-                    itens,
-                    valor_total,
-                    origem,
-                    status,
-                    data_criacao
-                FROM pedidos_delivery
-                WHERE status IN (
-                    'novo',
-                    'preparo',
-                    'caminho'
-                )
-                ORDER BY data_criacao ASC, id ASC
-            `);
-
-            return res.json(resultado.rows);
-        } catch (error) {
-            console.error(
-                'Erro ao listar delivery:',
-                error
-            );
-
-            return res.status(500).json({
-                error: 'Não foi possível carregar os pedidos.'
-            });
-        }
+app.get('/api/delivery/listar', verifyAdminToken, async (req, res) => {
+    try {
+        await verificarDeliveryDB();
+        const resultado = await pool.query(`
+            SELECT id, cliente, cliente_nome, endereco, itens, valor_total, origem, status, data_criacao
+            FROM pedidos_delivery
+            WHERE status IN ('novo', 'preparo', 'caminho')
+            ORDER BY data_criacao ASC, id ASC
+        `);
+        return res.json(resultado.rows);
+    } catch (error) {
+        console.error('Erro ao listar delivery:', error);
+        return res.status(500).json({ error: 'Não foi possível carregar os pedidos.' });
     }
-);
+});
 
-// ==========================================
-// DELIVERY: ATUALIZAR ETAPA
-// ==========================================
-app.post(
-    '/api/delivery/status',
-    verifyAdminToken,
-    async (req, res) => {
-        const { id, status } = req.body || {};
-
-        const anterior = {
-            preparo: 'novo',
-            caminho: 'preparo',
-            entregue: 'caminho'
-        };
-
-        if (
-            !Number.isSafeInteger(id) ||
-            id <= 0 ||
-            !Object.hasOwn(anterior, status)
-        ) {
-            return res.status(400).json({
-                error: 'Pedido ou status inválido.'
-            });
-        }
-
-        try {
-            await verificarDeliveryDB();
-
-            const resultado = await pool.query(
-                `
-                    UPDATE pedidos_delivery
-                    SET
-                        status = $1,
-                        data_atualizacao = NOW()
-                    WHERE id = $2
-                    AND status = $3
-                    RETURNING id, status
-                `,
-                [status, id, anterior[status]]
-            );
-
-            if (!resultado.rows.length) {
-                return res.status(409).json({
-                    error:
-                        'Pedido não encontrado ou já mudou de status. Atualize a lista.'
-                });
-            }
-
-            io.emit('atualizacao_delivery');
-
-            return res.json({
-                sucesso: true,
-                pedido: resultado.rows[0]
-            });
-        } catch (error) {
-            console.error(
-                'Erro ao atualizar delivery:',
-                error
-            );
-
-            return res.status(500).json({
-                error: 'Não foi possível atualizar o pedido.'
-            });
-        }
+app.post('/api/delivery/status', verifyAdminToken, async (req, res) => {
+    const { id, status } = req.body || {};
+    const anterior = { preparo: 'novo', caminho: 'preparo', entregue: 'caminho' };
+    if (!Number.isSafeInteger(id) || id <= 0 || !Object.hasOwn(anterior, status)) {
+        return res.status(400).json({ error: 'Pedido ou status inválido.' });
     }
-);
+    try {
+        await verificarDeliveryDB();
+        const resultado = await pool.query(`
+            UPDATE pedidos_delivery SET status = $1, data_atualizacao = NOW()
+            WHERE id = $2 AND status = $3 RETURNING id, status
+        `, [status, id, anterior[status]]);
+        if (!resultado.rows.length) {
+            return res.status(409).json({ error: 'Pedido não encontrado ou já mudou de status. Atualize a lista.' });
+        }
+        io.emit('atualizacao_delivery');
+        return res.json({ sucesso: true, pedido: resultado.rows[0] });
+    } catch (error) {
+        console.error('Erro ao atualizar delivery:', error);
+        return res.status(500).json({ error: 'Não foi possível atualizar o pedido.' });
+    }
+});
 
-// ==========================================
-// INICIAR SERVIDOR
-// ==========================================
 const PORT = process.env.PORT || 3000;
-
 server.listen(PORT, () => {
-    console.log(
-        `Servidor rodando protegido na porta ${PORT}`
-    );
+    console.log(`Servidor rodando protegido na porta ${PORT}`);
 });
