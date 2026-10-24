@@ -795,13 +795,29 @@ app.post('/api/delivery/novo', async (req, res) => {
         return res.status(400).json({ error: 'Informe o cliente e um carrinho válido.' });
     }
 
+    const tipoAtendimento = cliente.tipo_atendimento || 'entrega';
+    if (!['entrega', 'retirada'].includes(tipoAtendimento)) {
+        return res.status(400).json({ error: 'Tipo de atendimento inválido.' });
+    }
+    if (cliente.metodo_pagamento === 'PAGAR_NA_RETIRADA' && tipoAtendimento !== 'retirada') {
+        return res.status(400).json({ error: 'Pagar na retirada está disponível somente para pedidos de retirada.' });
+    }
+    const clienteSalvo = { ...cliente, tipo_atendimento: tipoAtendimento, pago_online: false };
+    // A confirmação real de pagamento deverá vir da futura integração no servidor.
+    clienteSalvo.status_pagamento = cliente.metodo_pagamento === 'PAGAR_NA_RETIRADA'
+        ? 'pendente_na_retirada' : cliente.pagamento_simulado === true ? 'simulado' : 'pendente';
+    if (tipoAtendimento === 'retirada') {
+        clienteSalvo.rua = ''; clienteSalvo.numero = '';
+        clienteSalvo.bairro = ''; clienteSalvo.complemento = '';
+    }
+
     // Compatível com o carrinho enviado pelo cardápio de WhatsApp.
     const totalCentavos = itens.reduce((total, item) =>
         total + Math.round(item.unitPrice * 100) * item.quantity, 0);
     if (!Number.isSafeInteger(totalCentavos) || totalCentavos > 999999999999) {
         return res.status(400).json({ error: 'Valor do pedido inválido.' });
     }
-    const endereco = [
+    const endereco = tipoAtendimento === 'retirada' ? 'Retirada no restaurante' : [
         [cliente.rua, cliente.numero].filter(Boolean).join(', '),
         cliente.bairro, cliente.complemento
     ].filter(Boolean).join(' - ');
@@ -813,7 +829,7 @@ app.post('/api/delivery/novo', async (req, res) => {
                 (cliente, cliente_nome, endereco, itens, valor_total, origem, status)
             VALUES ($1::jsonb, $2, $3, $4::jsonb, $5, $6, 'novo')
             RETURNING id, status
-        `, [JSON.stringify(cliente), cliente.nome.trim(), endereco,
+        `, [JSON.stringify(clienteSalvo), cliente.nome.trim(), endereco,
             JSON.stringify(itens), totalCentavos / 100,
             typeof origem === 'string' && origem.trim() ? origem.trim() : 'WHATSAPP_DELIVERY']);
 
